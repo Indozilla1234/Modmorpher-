@@ -1,28 +1,105 @@
-MIT License
+ModMorpher Source Available License
+Copyright (c) 2026 Indozilla1234. All Rights Reserved.
 
-Copyright (c) 2026 Indozilla1234
+This license governs the use, modification, and distribution of ModMorpher
+(the "Software"). By using, copying, or contributing to the Software, you
+agree to the terms below.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PERMITTED USES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You ARE permitted to:
 
-The rights granted above are explicitly conditional on ethical use. Use of this Software to convert, port, or migrate any mod, asset, or creative work that you did not author, or for which you do not hold explicit written permission from the original creator, is a violation of this license and grounds for termination of your rights under it.
-Specifically, this Software may not be used to:
+  a) View, read, and study the source code for personal or educational purposes.
 
-Convert ARR (All Rights Reserved) mods without the original author's written consent
-Circumvent Minecraft Marketplace protections or DRM of any kind
-Redistribute converted assets in any form without authorization from the original creator
+  b) Use the Software to convert, port, or migrate mods, assets, or creative
+     works that you personally authored.
+
+  c) Use the Software to convert, port, or migrate mods, assets, or creative
+     works for which you hold explicit written permission from the original
+     author(s).
+
+  d) Fork or modify the Software for personal, private use, provided the
+     modified version is not redistributed.
+
+  e) Contribute to the Software via pull requests or patches, subject to
+     acceptance by the maintainer (Indozilla1234).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PROHIBITED USES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You ARE NOT permitted to:
+
+  a) Use the Software to convert, port, or migrate any mod, asset, or creative
+     work that you did not author and for which you do not hold explicit written
+     permission from the original creator. This includes but is not limited to
+     mods licensed under All Rights Reserved (ARR), paid mods, or any mod
+     whose author has not granted cross-platform porting rights. 
+     However, open-source mods whose license explicitly permits modification, porting,
+     or redistribution may be considered as granting permission, subject to the terms of that license.
+
+  b) Circumvent, bypass, or undermine any DRM, Marketplace protection, or
+     access control associated with Minecraft: Bedrock Edition, the Minecraft
+     Marketplace, or any third-party mod distribution platform.
+
+  c) Redistribute, publish, upload, or share any assets, outputs, or converted
+     content derived from mods or works you do not own or have permission to
+     convert.
+
+  d) Redistribute, resell, sublicense, or commercially exploit the Software
+     itself, in whole or in part, without explicit written permission from
+     Indozilla1234.
+
+  e) Remove, alter, or obscure this license, copyright notices, or attribution
+     from any copy or fork of the Software.
+
+  f) Use the Software in any way that violates applicable intellectual property
+     law, including copyright law, in your jurisdiction.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. OWNERSHIP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Software is and remains the exclusive property of Indozilla1234. This
+license does not transfer ownership of the Software or any intellectual
+property rights therein. All rights not explicitly granted above are reserved.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TERMINATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Any violation of Section 2 of this license immediately and automatically
+terminates your rights to use, view, or interact with the Software. Indozilla1234
+reserves the right to pursue legal remedies for violations to the fullest
+extent permitted by applicable law.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
+
+IN NO EVENT SHALL INDOZILLA1234 BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM THE USE OF THIS SOFTWARE, INCLUDING ANY LIABILITY
+ARISING FROM A USER'S UNAUTHORIZED OR INFRINGING USE OF CONVERTED CONTENT.
+IT IS SOLELY THE USER'S RESPONSIBILITY TO ENSURE THEY HOLD THE RIGHTS TO ANY
+CONTENT THEY PROCESS USING THIS SOFTWARE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ABUSE REPORTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If you believe this Software is being used to infringe on your intellectual
+property, please open an issue on the official ModMorpher repository or
+contact the maintainer directly. Indozilla1234 will respond to valid
+complaints in good faith.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This license shall be governed by the laws of Indiana of The United States of America
+
+Copyright (c) 2026 Indozilla1234. All Rights Reserved.

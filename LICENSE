@@ -1,108 +1,72 @@
-ModMorpher Source Available(not to be confused with open source, look it up) License v1.0
+ModMorpher Source Available License v1.1
 Copyright (c) 2026 Indozilla1234. Most Rights Reserved.
 
-"Software" refers to the ModMorpher program, its source code,
-build scripts, documentation, and associated assets.
-
-This license governs the use, modification, and distribution of ModMorpher
-(the "Software"). By using, copying, or contributing to the Software, you
-agree to the terms below.
+"Software" refers to the ModMorpher program, its source code, build scripts, documentation, and associated assets. This is a Source Available license; it is not an Open Source license as defined by the OSI.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 1. PERMITTED USES
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 You ARE permitted to:
 
-  a) View, read, and study the source code for personal or educational purposes.
+a) View, read, and study the source code for personal or educational purposes.
 
-  b) Use the Software to convert, port, or migrate mods, assets, or creative
-     works that you personally authored.
+b) Use the Software to convert, port, or migrate mods/assets that you personally authored or have explicit written permission to modify.
 
-  c) Use the Software to convert, port, or migrate mods, assets, or creative
-     works for which you hold explicit written permission from the original
-     author(s).
+c) Fork and Modify: Create public or private forks of the Software on hosting platforms (e.g., GitHub, GitLab).
 
-  d) Fork or modify the Software for personal, private use, provided the
-     modified version is not redistributed.
+d) Distribute Modifications: Redistribute modified versions of the source code only if the purpose is to submit improvements to the original Software via Pull Request or to provide a community patch that requires the original Software to function.
 
-  e) Contribute to the Software via pull requests or patches, subject to
-     acceptance by the maintainer (Indozilla1234).
+e) Contribute to the Software via pull requests, subject to acceptance by Indozilla1234.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2. PROHIBITED USES
+
+2. PROHIBITED USES (THE "STRICT" CLAUSES)
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 You ARE NOT permitted to:
 
-  a) Use the Software to convert, port, or migrate any mod, asset, or creative
-     work that you did not author and for which you do not hold explicit 
-     permission from the original creator. This includes but is not limited to
-     mods licensed under All Rights Reserved (ARR), paid mods, or any mod
-     whose author has not granted cross-platform porting rights. 
-     However, open-source mods whose license explicitly permits modification, porting,
-     or redistribution may be considered as granting permission, subject to the terms of that license.
+a) Hard Forking & Fragmentation: You may not redistribute the Software or its derivatives as a separate, competing product. Any public fork must remain downstream of the original repository and may not be rebranded or marketed as a replacement for ModMorpher.
 
-  b) Circumvent, bypass, or undermine any DRM, Marketplace protection, or
-     access control associated with Minecraft: Bedrock Edition, the Minecraft
-     Marketplace, or any third-party mod distribution platform.
+b) Unauthorized Conversion: Use the Software to convert any mod or asset for which you do not hold explicit permission.
 
-  c) Redistribute, publish, upload, or share any assets, outputs, or converted
-     content derived from mods or works you do not own or have permission to
-     convert.
+c) Circumvention: Bypass any DRM or access control associated with Minecraft: Bedrock Edition or the Minecraft Marketplace.
 
-  d) Redistribute, resell, sublicense, or commercially exploit the Software
-     itself, in whole or in part, without explicit written permission from
-     Indozilla1234.
+d) Commercialization: Redistribute, resell, or commercially exploit the Software (or its forks) without explicit written permission from Indozilla1234.
 
-  e) Remove, alter, or obscure this license, copyright notices, or attribution
-     from any copy or fork of the Software.
+e) Trademark & Attribution: Remove or alter the "ModMorpher" name, copyright notices, or this license. You may not use the name "ModMorpher" for any modified version in a way that suggests it is the official version.
 
-  f) Use the Software in any way that violates applicable intellectual property
-     law, including copyright law, in your jurisdiction.
+f) Standalone Redistribution: You may not host a "compiled" (.exe, .jar, etc.) version of a fork for public download if it is intended to bypass the official distribution channels.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-3. OWNERSHIP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-The Software is and remains the exclusive property of Indozilla1234. This
-license does not transfer ownership of the Software or any intellectual
-property rights therein. All rights not explicitly granted above are reserved.
+3. OWNERSHIP & CONTRIBUTIONS
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Software remains the exclusive property of Indozilla1234. By submitting a Pull Request or contribution, you grant Indozilla1234 a non-exclusive, irrevocable, royalty-free license to use, modify, and redistribute your contribution as part of the Software.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 4. TERMINATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Any violation of Section 2 will result in termination of your rights to use, audit,
-or contribute to the Software if the violation is not remedied within ten (10) days after notice is given. Indozilla1234
-reserves the right to pursue legal remedies for violations to the fullest
-extent permitted by applicable law.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-5. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
-
-IN NO EVENT SHALL INDOZILLA1234 BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
-LIABILITY ARISING FROM THE USE OF THIS SOFTWARE, INCLUDING ANY LIABILITY
-ARISING FROM A USER'S UNAUTHORIZED OR INFRINGING USE OF CONVERTED CONTENT.
-IT IS SOLELY THE USER'S RESPONSIBILITY TO ENSURE THEY HOLD THE RIGHTS TO ANY
-CONTENT THEY PROCESS USING THIS SOFTWARE.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. ABUSE REPORTING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-If you believe this Software is being used to infringe on your intellectual
-property, please open an issue on the official ModMorpher repository or
-contact the maintainer directly. Indozilla1234 will respond to valid
-complaints in good faith.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-This license shall be governed by the laws of Indiana of The United States of America
+Any violation of Section 2 will result in the immediate and automatic termination of your rights under this license. If the violation is not remedied within ten (10) days of notice, your right to use or host any forks of the Software is permanently revoked.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5. DISCLAIMER & LIMITATION OF LIABILITY
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT SHALL INDOZILLA1234 BE LIABLE FOR ANY CLAIM, DAMAGES, OR LEGAL ISSUES ARISING FROM THE UNAUTHORIZED USE OF CONVERTED CONTENT BY USERS.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Governing Law: This license is governed by the laws of the State of Indiana, United States of America.
 
 Copyright (c) 2026 Indozilla1234. Most Rights Reserved.

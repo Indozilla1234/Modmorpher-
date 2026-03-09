@@ -4,15 +4,15 @@ public class ClassDecompiler {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         if (args.length < 2) {
-            System.out.println("Usage: java ClassDecompiler <path to .jar> <output folder>");
+            System.out.println("Usage: java ClassDecompiler <input.jar> <outputFolder>");
             return;
         }
 
-        File jarFile = new File(args[0]);
+        File inputJar = new File(args[0]);
         File outputDir = new File(args[1]);
 
-        if (!jarFile.exists()) {
-            System.err.println("❌ File not found: " + jarFile.getAbsolutePath());
+        if (!inputJar.exists()) {
+            System.err.println("❌ Input JAR not found: " + inputJar.getAbsolutePath());
             return;
         }
 
@@ -20,17 +20,20 @@ public class ClassDecompiler {
             outputDir.mkdirs();
         }
 
-        String procyonPath = "tools/procyon-decompiler-0.6.0.jar";
-        File procyonFile = new File(procyonPath);
-        if (!procyonFile.exists()) {
-            System.err.println("❌ Procyon jar not found at: " + procyonFile.getAbsolutePath());
+        // This is the main Vineflower JAR (the CLI is built into it)
+        File vineflowerJar = new File("tools/vineflower.jar");
+
+        if (!vineflowerJar.exists()) {
+            System.err.println("❌ Vineflower JAR not found at: " + vineflowerJar.getAbsolutePath());
             return;
         }
 
+        // Vineflower CLI syntax:
+        // java -jar vineflower.jar [args...] input.jar output/
         ProcessBuilder pb = new ProcessBuilder(
-                "java", "-jar", procyonFile.getAbsolutePath(),
-                "-jar", jarFile.getAbsolutePath(),
-                "-o", outputDir.getAbsolutePath()
+                "java", "-jar", vineflowerJar.getAbsolutePath(),
+                inputJar.getAbsolutePath(),
+                outputDir.getAbsolutePath()
         );
 
         pb.redirectErrorStream(true);
@@ -39,15 +42,16 @@ public class ClassDecompiler {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                
+                System.out.println(line); // Show Vineflower CLI output
             }
         }
 
         int exitCode = process.waitFor();
         if (exitCode == 0) {
-            System.out.println("📂 Output folder: " + outputDir.getAbsolutePath());
+            System.out.println("🌿 Decompilation complete!");
+            System.out.println("📁 Output: " + outputDir.getAbsolutePath());
         } else {
-            System.err.println("❌ Procyon exited with code " + exitCode);
+            System.err.println("❌ Vineflower exited with code " + exitCode);
         }
     }
 }

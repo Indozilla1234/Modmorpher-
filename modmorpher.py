@@ -1383,81 +1383,52 @@ def build_geckolib_mappings(java_root="."):
 # Java parsing helpers, extractors, and converters
 # (most logic reused from earlier working script — kept intact)
 # -------------------------
-def extract_attributes_from_java(java_code: str):
-    attributes = {
-        "health": 20.0, "attack_damage": 3.0, "movement_speed": 0.3,
-        "follow_range": 16.0, "knockback_resistance": 0.0, "armor": 0.0,
-        "armor_toughness": 0.0, "attack_knockback": 0.0,
-        "attack_speed": 4.0, "flying_speed": 0.0,
-    }
-    ATTR_ALIASES = {
-        "health":              ["MAX_HEALTH", "maxHealth", "f_22284_", "max_health", "Attributes.MAX_HEALTH", "SharedMonsterAttributes.MAX_HEALTH"],
-        "attack_damage":       ["ATTACK_DAMAGE", "attackDamage", "f_22278_", "Attributes.ATTACK_DAMAGE", "SharedMonsterAttributes.ATTACK_DAMAGE"],
-        "movement_speed":      ["MOVEMENT_SPEED", "movementSpeed", "f_22279_", "MOVE_SPEED", "Attributes.MOVEMENT_SPEED"],
-        "follow_range":        ["FOLLOW_RANGE", "followRange", "f_22276_", "Attributes.FOLLOW_RANGE"],
-        "knockback_resistance":["KNOCKBACK_RESISTANCE", "knockbackResistance", "f_22281_", "Attributes.KNOCKBACK_RESISTANCE"],
-        "armor":               ["ARMOR", "f_22277_", "Attributes.ARMOR"],
-        "armor_toughness":     ["ARMOR_TOUGHNESS", "armorToughness", "Attributes.ARMOR_TOUGHNESS"],
-        "attack_knockback":    ["ATTACK_KNOCKBACK", "attackKnockback", "Attributes.ATTACK_KNOCKBACK"],
-        "attack_speed":        ["ATTACK_SPEED", "attackSpeed", "Attributes.ATTACK_SPEED"],
-        "flying_speed":        ["FLYING_SPEED", "flyingSpeed", "Attributes.FLYING_SPEED"],
-    }
-    defaults_snapshot = {"health":20.0,"attack_damage":3.0,"movement_speed":0.3,"follow_range":16.0,
-                         "knockback_resistance":0.0,"armor":0.0,"armor_toughness":0.0,
-                         "attack_knockback":0.0,"attack_speed":4.0,"flying_speed":0.0}
-    for attr_key, aliases in ATTR_ALIASES.items():
-        for alias in aliases:
-            escaped = re.escape(alias)
-            pat = rf"{escaped}[^,\n\r;{{}}()]*?[,(]\s*([0-9]+(?:\.[0-9]+)?)[DdFfLl]?\s*[,)\n;]"
-            m = re.search(pat, java_code)
-            if m:
-                try:
-                    attributes[attr_key] = float(m.group(1)); break
-                except Exception:
-                    pass
-    # Chained .add(Attributes.X, value) builder pattern (Forge 1.17+)
-    for attr_key, aliases in ATTR_ALIASES.items():
-        if attributes[attr_key] != defaults_snapshot.get(attr_key, 0.0):
-            continue
-        for alias in aliases:
-            short = alias.split(".")[-1]
-            m = re.search(rf'.add\s*\(\s*(?:[A-Za-z]+\.)*{re.escape(short)}\s*,\s*([0-9]+(?:\.[0-9]+)?)', java_code)
-            if m:
-                try:
-                    attributes[attr_key] = float(m.group(1)); break
-                except Exception: pass
-    # Secondary: scan createAttributes builder block
-    bblock = re.search(
-        r'(?:createAttributes|getDefaultAttributes|createMobAttributes|createLivingAttributes|createMonsterAttributes|createAnimalAttributes|registerAttributes)\s*[^{;]*[{(]([^}]{0,2000})',
-        java_code, re.DOTALL)
-    if bblock:
-        block = bblock.group(1)
-        for attr_key, aliases in ATTR_ALIASES.items():
-            if attributes[attr_key] != defaults_snapshot.get(attr_key, 0.0):
-                continue
-            for alias in aliases:
-                esc = re.escape(alias.split(".")[-1])
-                m = re.search(rf"{esc}[^,\n)]*?,\s*([0-9]+(?:\.[0-9]+)?)", block)
-                if m:
-                    try:
-                        attributes[attr_key] = float(m.group(1)); break
-                    except Exception: pass
-    # Tertiary: static AttributeSupplier field block
-    static_block = re.search(r'AttributeSupplier[^;]{0,800};', java_code, re.DOTALL)
-    if static_block:
-        block = static_block.group(0)
-        for attr_key, aliases in ATTR_ALIASES.items():
-            if attributes[attr_key] != defaults_snapshot.get(attr_key, 0.0):
-                continue
-            for alias in aliases:
-                esc = re.escape(alias.split(".")[-1])
-                m = re.search(rf"{esc}[^,\n)]*?,\s*([0-9]+(?:\.[0-9]+)?)", block)
-                if m:
-                    try:
-                        attributes[attr_key] = float(m.group(1)); break
-                    except Exception: pass
-    return attributes
+import re
 
+import re
+
+def extract_attributes_from_java(java_code: str):
+    # This is the exact physical order from the code you provided:
+    # 1. f_22279_ (0.3)
+    # 2. f_22276_ (1024.0)
+    # 3. f_22284_ (100.0)
+    # 4. f_22281_ (9.0)
+    # 5. f_22277_ (2048.0)
+    # 6. f_22278_ (1000.0)
+    
+    ORDER_MAPPING = [
+        "movement_speed",      # Slot 1
+        "follow_range",        # Slot 2
+        "health",              # Slot 3
+        "knockback_resistance",# Slot 4
+        "armor",               # Slot 5
+        "attack_damage"        # Slot 6
+    ]
+
+    # Find the specific block for attributes to avoid picking up 
+    # numbers from procedures or animations elsewhere in the file.
+    block_match = re.search(r'public static Builder createAttributes\(\) \{(.*?)\}', java_code, re.DOTALL)
+    if not block_match:
+        return {"error": "Could not find createAttributes block"}
+
+    attribute_block = block_match.group(1)
+
+    # Extract every number passed as the second argument in the .m_22268_ or .add calls
+    # Matches: , 0.3) or , 1024.0)
+    values = re.findall(r',\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)', attribute_block)
+
+    results = {}
+    for i, val_str in enumerate(values):
+        if i < len(ORDER_MAPPING):
+            # Clean Java suffixes (D, f, L) and convert to float
+            clean_val = float(re.sub(r'[DdFfLl]', '', val_str))
+            results[ORDER_MAPPING[i]] = clean_val
+
+    return results
+
+# Example usage with your provided code:
+# attributes = extract_attributes_by_physical_order(your_java_string)
+# print(attributes)
 def extract_animations_from_java(java_code: str, namespace: Optional[str] = None, entity_name: Optional[str] = None):
     """
     Extract animation IDs referenced in Java entity/renderer code.

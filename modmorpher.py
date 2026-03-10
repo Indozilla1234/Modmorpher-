@@ -597,12 +597,15 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
                         shutil.copyfileobj(src_file, out_file)
                     continue
 
-                # models -> RP/models
+                # models -> RP/models (and attempt GeckoLib conversion for vanilla models)
                 if (lower_file.endswith(".json") and "/models/" in lower_file) or lower_file.endswith(".geo.json"):
                     dest = os.path.join(resource_pack, "models", sanitize_filename_keep_ext(os.path.basename(file)))
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with jar.open(file) as src_file, open(dest, "wb") as out_file:
                         shutil.copyfileobj(src_file, out_file)
+                    # Also attempt conversion to GeckoLib geometry for non-GeckoLib mods
+                    if lower_file.endswith(".json") and "/models/" in lower_file and not lower_file.endswith(".geo.json"):
+                        try_convert_model_from_jar(jar, file, resource_pack)
                     continue
 
                 # animations -> RP/animations
@@ -779,6 +782,119 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
 
             except Exception as ex:
                 print(f"[asset copy error] {file} -> {ex}")
+
+# -------------------------
+# Vanilla Java model -> GeckoLib geometry converter
+# Handles non-GeckoLib MCreator mods (pre-GeckoLib era and vanilla renderer mods)
+# -------------------------
+def convert_vanilla_model_to_geckolib(classic: dict, model_name: str = "model") -> dict:
+    """
+    Convert a vanilla Minecraft block/entity model JSON to GeckoLib .geo.json format.
+    Works on any Blockbench-exported or MCreator-generated vanilla model.
+    """
+    bones = []
+
+    elements = classic.get("elements", [])
+    groups   = classic.get("groups", [])
+    tex_size = classic.get("texture_size", [16, 16])
+
+    def extract_uv(element: dict):
+        faces = element.get("faces", {})
+        north = faces.get("north", {}).get("uv", [0, 0, 16, 16])
+        return [north[0], north[1]]
+
+    def convert_rotation(rot: dict) -> dict:
+        axis  = rot.get("axis", "x")
+        angle = rot.get("angle", 0)
+        return {
+            "x": angle if axis == "x" else 0,
+            "y": angle if axis == "y" else 0,
+            "z": angle if axis == "z" else 0,
+        }
+
+    def element_to_cube(el: dict) -> dict:
+        from_pos = el["from"]
+        to_pos   = el["to"]
+        cube = {
+            "origin": [from_pos[0] - 8, from_pos[1], from_pos[2] - 8],
+            "size":   [to_pos[0] - from_pos[0], to_pos[1] - from_pos[1], to_pos[2] - from_pos[2]],
+            "uv":     extract_uv(el),
+        }
+        if "rotation" in el:
+            cube["rotation"] = convert_rotation(el["rotation"])
+        return cube
+
+    def process_group(group):
+        if isinstance(group, int):
+            return  # bare element index at top level — handled below
+        bone = {
+            "name":   group.get("name", "bone"),
+            "pivot":  [group["origin"][0] - 8, group["origin"][1], group["origin"][2] - 8],
+            "cubes":  [],
+        }
+        for child in group.get("children", []):
+            if isinstance(child, int) and child < len(elements):
+                bone["cubes"].append(element_to_cube(elements[child]))
+            elif isinstance(child, dict):
+                process_group(child)  # nested groups become sibling bones
+        bones.append(bone)
+
+    if groups:
+        for group in groups:
+            process_group(group)
+    else:
+        # No groups — wrap everything in a single root bone
+        root = {"name": "root", "pivot": [0, 0, 0], "cubes": []}
+        for el in elements:
+            root["cubes"].append(element_to_cube(el))
+        bones.append(root)
+
+    return {
+        "format_version": "1.12.0",
+        "minecraft:geometry": [
+            {
+                "description": {
+                    "identifier":            f"geometry.{model_name}",
+                    "texture_width":         tex_size[0],
+                    "texture_height":        tex_size[1],
+                    "visible_bounds_width":  2,
+                    "visible_bounds_height": 2,
+                    "visible_bounds_offset": [0, 1, 0],
+                },
+                "bones": bones,
+            }
+        ],
+    }
+
+
+def try_convert_model_from_jar(jar, file_path: str, resource_pack: str) -> bool:
+    """
+    Try to read a vanilla model JSON from the JAR, convert it to GeckoLib geometry,
+    and write it to RP/geometry/. Returns True if conversion succeeded.
+    """
+    try:
+        with jar.open(file_path) as fh:
+            data = json.loads(fh.read().decode("utf-8"))
+    except Exception:
+        return False
+
+    # Must have elements to be a geometry model (not a blockstate or item override)
+    if "elements" not in data and "groups" not in data:
+        return False
+
+    model_name = sanitize_identifier(os.path.splitext(os.path.basename(file_path))[0])
+    try:
+        geckolib_data = convert_vanilla_model_to_geckolib(data, model_name)
+    except Exception as e:
+        print(f"[model-convert] Failed to convert {file_path}: {e}")
+        return False
+
+    out_path = os.path.join(resource_pack, "geometry", f"{model_name}.geo.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    safe_write_json(out_path, geckolib_data)
+    print(f"[model-convert] Converted vanilla model -> GeckoLib: {file_path} -> {out_path}")
+    return True
+
 
 def copy_geckolib_animations_from_jar(jar_path: str, resource_pack: str):
     with zipfile.ZipFile(jar_path, 'r') as jar:
@@ -1383,10 +1499,6 @@ def build_geckolib_mappings(java_root="."):
 # Java parsing helpers, extractors, and converters
 # (most logic reused from earlier working script — kept intact)
 # -------------------------
-import re
-
-import re
-
 def extract_attributes_from_java(java_code: str):
     # This is the exact physical order from the code you provided:
     # 1. f_22279_ (0.3)

@@ -4018,6 +4018,23 @@ JAVA_TAG_TO_BEDROCK_GROUP = {
     "forge:bones": "misc",
     "forge:string": "misc",
     "forge:feathers": "misc",
+    # NeoForge uses the same tag paths but under the "neoforge" namespace
+    "neoforge:ores": "ore",
+    "neoforge:ingots": "ingot",
+    "neoforge:gems": "gem",
+    "neoforge:dusts": "dust",
+    "neoforge:nuggets": "nugget",
+    "neoforge:rods": "stick",
+    "neoforge:plates": "plate",
+    "neoforge:tools": "tool",
+    "neoforge:weapons": "weapon",
+    "neoforge:armor": "armor",
+    "neoforge:food": "food",
+    "neoforge:seeds": "seeds",
+    "neoforge:crops": "crop",
+    "neoforge:bones": "misc",
+    "neoforge:string": "misc",
+    "neoforge:feathers": "misc",
     "minecraft:logs": "log",
     "minecraft:planks": "planks",
     "minecraft:slabs": "slab",
@@ -6083,6 +6100,112 @@ def extract_logo_from_jar(jar_path: str) -> Optional[str]:
 
 
 # -------------------------
+# Loader / version validation
+# -------------------------
+
+# Minimum MC version supported per loader (as tuple for comparison)
+LOADER_MIN_VERSIONS: Dict[str, tuple] = {
+    "forge":    (1, 3),   # 1.3+  (not recommended below 1.12)
+    "neoforge": (1, 20),  # NeoForge only exists from 1.20.1 onward
+    "fabric":   None,     # Unsupported - warn and abort
+    "quilt":    None,     # Unsupported - warn and abort
+}
+
+# NeoForge did not exist before 1.20.1
+NEOFORGE_MIN_VERSION = (1, 20, 1)
+
+
+def detect_mc_version_from_jar(jar_path: str) -> Optional[tuple]:
+    """
+    Attempt to detect the Minecraft version from a JAR file.
+    Checks META-INF/mods.toml, META-INF/neoforge.mods.toml, or version string
+    embedded in the JAR filename itself (e.g. mymod-1.20.4-2.0.jar).
+    Returns a version tuple like (1, 20, 4) or None if not detected.
+    """
+    toml_candidates = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"]
+    try:
+        with zipfile.ZipFile(jar_path, "r") as jar:
+            names_lower = {n.lower(): n for n in jar.namelist()}
+            for candidate in toml_candidates:
+                real_name = names_lower.get(candidate.lower())
+                if not real_name:
+                    continue
+                try:
+                    with jar.open(real_name) as f:
+                        content_toml = f.read().decode("utf-8", errors="ignore")
+                    for pat in [
+                        r'loaderVersion\s*=\s*["\'\']?\[?([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+                        r'(?:dependencies\.minecraft|minecraft\.version)\s*=\s*["\'\']([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+                        r'\[dependencies\.[^\]]+\]\s*[^\[]*?versionRange\s*=\s*["\'\']?\[([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+                    ]:
+                        m = re.search(pat, content_toml, re.IGNORECASE)
+                        if m:
+                            parts = tuple(int(x) for x in m.group(1).split("."))
+                            return parts
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    fname = os.path.basename(jar_path)
+    m = re.search(r'[_\-](1\.[0-9]+(?:\.[0-9]+)?)[_\-]', fname)
+    if m:
+        parts = tuple(int(x) for x in m.group(1).split("."))
+        return parts
+
+    return None
+
+
+def validate_loader_support(loader: str, mc_version: Optional[tuple]) -> bool:
+    """
+    Validate that the detected loader (and optionally MC version) is supported.
+    Prints informative warnings/errors and returns False if the pipeline should abort.
+    """
+    UNSUPPORTED_LOADERS = {"fabric", "quilt"}
+
+    if loader in UNSUPPORTED_LOADERS:
+        print(f"\n\u274c Unsupported mod loader detected: {loader.upper()}")
+        print(  "   ModMorpher currently supports Forge and NeoForge (MCreator) mods only.")
+        print(  "   Fabric and Quilt mods use a fundamentally different architecture")
+        print(  "   and are not yet supported.\n")
+        return False
+
+    if loader == "unknown":
+        print("\n\u26a0  Could not detect mod loader from JAR.")
+        print(  "   Proceeding anyway, but results may be incomplete.")
+        return True
+
+    if loader == "neoforge":
+        if mc_version is not None and mc_version < NEOFORGE_MIN_VERSION:
+            print(f"\n\u274c NeoForge does not exist for Minecraft {'.'.join(str(x) for x in mc_version)}.")
+            print(  "   NeoForge was introduced in Minecraft 1.20.1.")
+            print(  "   If your mod targets an earlier version, it uses Forge, not NeoForge.")
+            return False
+        version_str = '.'.join(str(x) for x in mc_version) if mc_version else "unknown"
+        print(f"[loader] \u2713 NeoForge mod detected (MC {version_str}) -- full support enabled.")
+        if mc_version is None:
+            print("   \u26a0  Could not detect MC version from JAR; assuming 1.20.1+.")
+        return True
+
+    if loader == "forge":
+        if mc_version is not None:
+            version_str = '.'.join(str(x) for x in mc_version)
+            if mc_version >= (1, 18):
+                print(f"[loader] \u2713 Forge mod detected (MC {version_str}) -- best results expected.")
+            elif mc_version >= (1, 12):
+                print(f"[loader] \u26a0  Forge mod detected (MC {version_str}) -- manual work may be needed.")
+            else:
+                print(f"[loader] \u26a0  Forge mod detected (MC {version_str}) -- NOT RECOMMENDED. "
+                      "Very old versions may produce incomplete output.")
+        else:
+            print("[loader] \u2713 Forge mod detected (MC version unknown).")
+        return True
+
+    print(f"[loader] \u26a0  Unknown loader '{loader}' -- proceeding with best-effort conversion.")
+    return True
+
+
+# -------------------------
 # Main pipeline
 # -------------------------
 def run_pipeline():
@@ -6102,7 +6225,10 @@ def run_pipeline():
 
     if jar_path:
         jar_loader = detect_loader_from_jar(jar_path)
-        print(f"[loader] Detected mod loader: {jar_loader}")
+        mc_version = detect_mc_version_from_jar(jar_path)
+        if not validate_loader_support(jar_loader, mc_version):
+            print("\nAborting pipeline due to unsupported loader. See above for details.")
+            return
         copy_assets_from_jar(jar_path, RP_FOLDER)
         copy_geckolib_animations_from_jar(jar_path, RP_FOLDER)
         logo = extract_logo_from_jar(jar_path)

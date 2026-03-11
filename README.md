@@ -24,6 +24,7 @@ ModMorpher only works with mods built using **MCreator** on **Forge or NeoForge*
 | 1.18+ | Forge | ⭐ Best |
 | 1.12+ | Forge | ⚠️ **WILL** need manual fixes |
 | 1.3+ | Forge | ❌ Not recommended |
+| Any Version | Fabric/Quilt | ❌ **NOT SUPPORTED**
   
 ### Prerequisites
 * **Python 3.10+** (System Path)

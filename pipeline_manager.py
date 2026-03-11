@@ -1,21 +1,21 @@
 import os
 import subprocess
-import modmorpher  # your merged script
+import modmorpher
 
 def run_class_decompiler(jar_file, output_dir):
     """Compile and run ClassDecompiler.java to decompile the jar"""
     java_file = os.path.join(os.path.dirname(__file__), "ClassDecompiler.java")
 
     if not os.path.isfile(java_file):
-        print("❌ ClassDecompiler.java not found!")
+        print("ERROR: ClassDecompiler.java not found")
         return False
 
-    print("🔹 Compiling ClassDecompiler.java...")
+    print("Compiling ClassDecompiler.java...")
     subprocess.run(["javac", java_file], check=True)
 
-    print(f"🔹 Running ClassDecompiler on {jar_file}...")
+    print(f"Running ClassDecompiler on {jar_file}...")
     subprocess.run(["java", "ClassDecompiler", jar_file, output_dir], check=True)
-    print("✅ Decompilation completed.")
+    print("Decompilation completed.")
     return True
 
 def main():
@@ -24,7 +24,7 @@ def main():
     # Step 1: Locate .jar file
     jar_file = next((f for f in os.listdir(".") if f.endswith(".jar")), None)
     if not jar_file:
-        print("⚠️ No .jar file found in the directory.")
+        print("WARN: No .jar file found in the directory.")
         return
 
     # Step 2: Define decompiled output folder
@@ -36,10 +36,9 @@ def main():
         return
 
     # Step 4: Run the merged converter pipeline
-    print("🔹 Running merged Pack Creator + Converter...")
     modmorpher.run_pipeline()
 
-    print("✅ Full pipeline completed successfully!")
+    print("Completed successfully!")
 
 if __name__ == "__main__":
     main()

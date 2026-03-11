@@ -6367,7 +6367,12 @@ def run_pipeline():
             print(w)
     else:
         print("\n✓ Validation passed - no missing references found")
+        print("Zipping Finished Addon!")
+        shutil.make_archive("Bedrock_Pack", "zip", "Bedrock_Pack")
+        shutil.move("Bedrock_Pack.zip", "Bedrock_Pack.mcaddon")
     print("--- done ---\n")
+    shutil.make_archive("Bedrock_Pack", "zip", "Bedrock_Pack")
+    shutil.move("Bedrock_Pack.zip", "Bedrock_Pack.mcaddon")
 
 if __name__ == "__main__":
     run_pipeline()

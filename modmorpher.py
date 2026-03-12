@@ -4,7 +4,174 @@ import json
 import uuid
 import zipfile
 import shutil
+import builtins
+import time
+import math
 from typing import Optional, Tuple, Dict, Set, List
+
+# ── tqdm progress bar (graceful fallback if not installed) ────────────────────
+try:
+    from tqdm import tqdm as _tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    _tqdm = None
+
+
+class _ProgressLogger:
+    """
+    Central output router for ModMorpher.
+
+    During a progress-bar phase:
+      • Lines flagged as WARN or ERROR are printed immediately above the bar
+        via tqdm.write() so they're never swallowed.
+      • Routine info lines are silenced — the bar's description carries phase
+        context instead.
+
+    Outside a phase the original print() is restored, so the startup banner
+    and final summary still appear normally.
+
+    Usage
+    -----
+        with _logger.phase("Copying JAR assets", total=0):
+            copy_assets_from_jar(...)
+
+        with _logger.phase("Processing Java files", total=len(java_files)) as bar:
+            for path, code in java_files.items():
+                bar.set_postfix_str(os.path.basename(path)[:40])
+                process(...)
+                bar.update(1)
+    """
+
+    # Text patterns that should always be shown regardless of log level
+    _WARN_PATTERNS = (
+        "⚠", "warn", "Warn", "WARN", "[WARN]",
+        "missing", "Missing", "placeholder", "fallback",
+        "skipped", "Skipped",
+    )
+    _ERROR_PATTERNS = (
+        "❌", "error", "Error", "ERROR",
+        "failed", "Failed", "exception", "Exception",
+        "crash", "Crash",
+    )
+
+    def __init__(self):
+        self._original_print = builtins.print
+        self._active_bar = None      # current tqdm instance
+        self._intercepting = False
+        self._deferred_messages: list = []  # collected during silent phases
+
+    # ── public helpers ────────────────────────────────────────────────────────
+
+    def write(self, *args, **kwargs):
+        """Drop-in replacement for print(); always routes through the logger."""
+        text = " ".join(str(a) for a in args)
+        if self._intercepting and self._active_bar is not None:
+            if self._is_visible(text):
+                _tqdm.write(self._format(text))
+            # else silently swallow
+        else:
+            self._original_print(text, **{k: v for k, v in kwargs.items() if k != "end"})
+
+    def warn(self, text: str):
+        msg = f"  ⚠  {text}"
+        if self._intercepting and self._active_bar is not None:
+            _tqdm.write(msg)
+        else:
+            self._original_print(msg)
+
+    def error(self, text: str):
+        msg = f"  ❌  {text}"
+        if self._intercepting and self._active_bar is not None:
+            _tqdm.write(msg)
+        else:
+            self._original_print(msg)
+
+    # ── context manager ───────────────────────────────────────────────────────
+
+    class _Phase:
+        def __init__(self, logger, desc, total, unit, colour):
+            self._logger = logger
+            self._desc = desc
+            self._total = total
+            self._unit = unit
+            self._colour = colour
+            self._bar = None
+
+        def __enter__(self):
+            if TQDM_AVAILABLE:
+                bar_fmt = (
+                    "  {desc:<38} {bar} {percentage:3.0f}%  "
+                    "{n_fmt}/{total_fmt} {unit} [{elapsed}]{postfix}"
+                )
+                self._bar = _tqdm(
+                    total=self._total if self._total > 0 else None,
+                    desc=self._desc,
+                    unit=self._unit,
+                    colour=self._colour,
+                    bar_format=bar_fmt if self._total > 0 else None,
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+                self._logger._active_bar = self._bar
+                self._logger._intercepting = True
+                builtins.print = self._logger.write
+            else:
+                # No tqdm — just print the phase header and let prints flow
+                builtins.print(f"\n── {self._desc} ──")
+            return self  # caller can use `as bar:` to call bar.update()
+
+        def __exit__(self, *_):
+            builtins.print = self._logger._original_print
+            self._logger._intercepting = False
+            self._logger._active_bar = None
+            if self._bar is not None:
+                self._bar.close()
+
+        def update(self, n: int = 1):
+            if self._bar:
+                self._bar.update(n)
+
+        def set_postfix_str(self, s: str):
+            if self._bar:
+                self._bar.set_postfix_str(s, refresh=False)
+
+        def set_description(self, s: str):
+            if self._bar:
+                self._bar.set_description(s, refresh=True)
+
+    def phase(self, desc: str, total: int = 0,
+              unit: str = "file", colour: str = "cyan"):
+        return self._Phase(self, desc, total, unit, colour)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _is_visible(self, text: str) -> bool:
+        for p in self._ERROR_PATTERNS:
+            if p in text:
+                return True
+        for p in self._WARN_PATTERNS:
+            if p in text:
+                return True
+        return False
+
+    @staticmethod
+    def _format(text: str) -> str:
+        """Indent pass-through messages so they visually separate from the bar."""
+        return f"    {text}"
+
+
+# Module-level logger instance — used by run_pipeline
+_logger = _ProgressLogger()
+
+# ── Cross-file lookup tables — populated once by run_pipeline ─────────────────
+# All Java source files found in the project (path → code)
+_ALL_JAVA_FILES: Dict[str, str] = {}
+
+# Every texture and geometry file found inside RP_FOLDER after asset extraction
+# textures: list of (rel_path_no_ext, abs_path)  e.g. ("entity/my_mob", "/rp/textures/entity/my_mob.png")
+# geometry: list of (identifier, abs_path)         e.g. ("geometry.mymod.dragon", "/rp/models/entity/dragon.geo.json")
+_RP_ASSET_INDEX: Dict[str, list] = {"textures": [], "geometry": []}
 
 # Pillow used for icon cropping/resizing. If missing, script warns and copies icons unmodified.
 try:
@@ -484,16 +651,20 @@ def detect_loader_from_jar(jar_path: str) -> str:
     return "unknown"
 
 
+def _extract_first_logo_from_jar_legacy(jar_path: str) -> Optional[str]:
     """
     Extract the first file that ends with 'logo.png' (case-insensitive).
     Returns path to the extracted file inside a temporary extraction folder, or None if not found.
     """
     temp_dir = ".temp_logo_extract"
-    with zipfile.ZipFile(jar_path, 'r') as jar:
-        for file in jar.namelist():
-            if file.lower().endswith("logo.png"):
-                jar.extract(file, temp_dir)
-                return os.path.join(temp_dir, file)
+    try:
+        with zipfile.ZipFile(jar_path, 'r') as jar:
+            for file in jar.namelist():
+                if file.lower().endswith("logo.png"):
+                    jar.extract(file, temp_dir)
+                    return os.path.join(temp_dir, file)
+    except Exception:
+        pass
     return None
 
 def sanitize_path_parts(path_str: str) -> List[str]:
@@ -867,6 +1038,287 @@ def convert_vanilla_model_to_geckolib(classic: dict, model_name: str = "model") 
     }
 
 
+def _extract_call_args(text: str, call_start: int, n_args: int) -> Optional[List[str]]:
+    """
+    Given text and the index of the opening '(' of a method call,
+    extract the first n_args comma-separated arguments respecting nested parens.
+    Returns list of argument strings, or None if parsing fails.
+    """
+    paren_pos = text.find('(', call_start)
+    if paren_pos == -1:
+        return None
+    i = paren_pos + 1
+    args: List[str] = []
+    depth = 1
+    buf: List[str] = []
+    while i < len(text) and depth > 0:
+        c = text[i]
+        if c == '(':
+            depth += 1
+            buf.append(c)
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                if len(args) < n_args:
+                    args.append(''.join(buf).strip())
+                break
+            else:
+                buf.append(c)
+        elif c == ',' and depth == 1:
+            if len(args) < n_args:
+                args.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    return args if len(args) >= n_args else None
+
+
+def _eval_rot_expr(expr: str) -> Optional[float]:
+    """
+    Evaluate common Java rotation expressions to degrees.
+    Handles: 0.0F, -1.5F, (float)Math.PI/4, Math.PI/6, etc.
+    Returns degrees or None on failure.
+    """
+    s = expr.strip().rstrip('Ff ')
+    s = re.sub(r'\(float\)\s*', '', s)
+    s = s.replace('Math.PI', str(math.pi))
+    try:
+        return math.degrees(float(s))
+    except (ValueError, TypeError):
+        pass
+    try:
+        if re.fullmatch(r'[-+*/().\d\s]+', s):
+            return math.degrees(eval(s))  # noqa: S307
+    except Exception:
+        pass
+    return None
+
+
+def _extract_method_body(java_code: str, method_names: List[str]) -> Optional[str]:
+    """Return the body (including braces) of the first matching method name."""
+    for name in method_names:
+        pat = re.compile(
+            rf'(?:public\s+|private\s+|protected\s+|static\s+)*'
+            rf'(?:\w+(?:<[^>]*>)?)\s+{re.escape(name)}\s*\([^)]*\)\s*\{{',
+            re.DOTALL
+        )
+        m = pat.search(java_code)
+        if not m:
+            continue
+        start = m.end() - 1
+        depth, i = 0, start
+        while i < len(java_code):
+            c = java_code[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return java_code[start:i + 1]
+            i += 1
+    return None
+
+
+def convert_layerdefinition_to_geckolib(
+    java_code: str,
+    model_name: str,
+    namespace: str,
+    entity_name: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Parse a Java EntityModel that uses the modern LayerDefinition / MeshDefinition /
+    PartDefinition API and convert it to a GeckoLib-compatible .geo.json dict.
+
+    Handles:
+      - PartPose.offset(x, y, z)
+      - PartPose.offsetAndRotation(x, y, z, rx, ry, rz)  — radians to degrees
+      - CubeListBuilder.create().texOffs(u, v).addBox(x, y, z, sx, sy, sz)
+      - Multiple addBox() calls per part
+      - Nested child bones (pivot accumulation up to 8 levels)
+      - LayerDefinition.create(mesh, texW, texH) for texture size
+
+    Returns None if no LayerDefinition content is found.
+    """
+    if 'LayerDefinition' not in java_code and 'MeshDefinition' not in java_code:
+        return None
+
+    LAYER_METHOD_NAMES = [
+        'createBodyLayer', 'createBodyModel', 'createMeshes', 'createLayers',
+        'createLayer', 'createModel', 'createModelData', 'bakeRoot',
+    ]
+    body = _extract_method_body(java_code, LAYER_METHOD_NAMES)
+    if body is None:
+        if 'addOrReplaceChild' not in java_code:
+            return None
+        body = java_code
+
+    # Texture dimensions
+    tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', body)
+    if not tex_m:
+        tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', java_code)
+    tex_w = int(tex_m.group(1)) if tex_m else 64
+    tex_h = int(tex_m.group(2)) if tex_m else 32
+
+    # Root variable
+    root_var_m = re.search(r'(\w+)\s*=\s*\w+\.getRoot\s*\(\)', body)
+    root_var = root_var_m.group(1) if root_var_m else 'partdefinition'
+
+    var_to_bone: Dict[str, dict] = {
+        root_var: {'name': '__root__', 'pivot': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0], 'cubes': []}
+    }
+    var_to_parent_var: Dict[str, str] = {}
+
+    CALL_START = re.compile(r'(\w+)\s*=\s*(\w+)\.addOrReplaceChild\s*\(')
+    for cs in CALL_START.finditer(body):
+        var_name   = cs.group(1)
+        parent_var = cs.group(2)
+        try:
+            paren_start = body.index('(', cs.end() - 1)
+        except ValueError:
+            continue
+        depth, i = 0, paren_start
+        while i < len(body):
+            if body[i] == '(':
+                depth += 1
+            elif body[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        args_content = body[paren_start + 1:i]
+
+        name_m = re.search(r'["\']([^"\']+)["\']', args_content)
+        bone_name = name_m.group(1) if name_m else var_name
+
+        pivot = [0.0, 0.0, 0.0]
+        rotation = [0.0, 0.0, 0.0]
+
+        pose_m = re.search(
+            r'PartPose\.offset\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)',
+            args_content
+        )
+        if pose_m:
+            for idx, grp in enumerate(pose_m.groups()):
+                v = _parse_java_float(grp.strip())
+                if v is not None:
+                    pivot[idx] = v
+
+        rot_idx = args_content.find('PartPose.offsetAndRotation')
+        if rot_idx != -1:
+            rot_args = _extract_call_args(args_content, rot_idx, 6)
+            if rot_args and len(rot_args) >= 6:
+                for idx in range(3):
+                    v = _parse_java_float(rot_args[idx].strip())
+                    if v is not None:
+                        pivot[idx] = v
+                for idx in range(3, 6):
+                    deg = _eval_rot_expr(rot_args[idx].strip())
+                    if deg is not None:
+                        rotation[idx - 3] = round(deg, 4)
+
+        cubes: list = []
+        cur_u, cur_v = 0, 0
+        for tex_m2 in re.finditer(r'\.texOffs\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', args_content):
+            cur_u = int(tex_m2.group(1))
+            cur_v = int(tex_m2.group(2))
+            after = args_content[tex_m2.end():]
+            ab = re.match(
+                r'\s*\.addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
+                r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
+                after
+            )
+            if ab:
+                try:
+                    vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
+                    cubes.append({
+                        "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
+                        "size":   vals[3:6],
+                        "uv":     [cur_u, cur_v],
+                    })
+                except (ValueError, TypeError):
+                    pass
+
+        for ab in re.finditer(
+            r'(?<!\w)addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
+            r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
+            args_content
+        ):
+            try:
+                vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
+                candidate = {
+                    "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
+                    "size":   vals[3:6],
+                    "uv":     [cur_u, cur_v],
+                }
+                if candidate not in cubes:
+                    cubes.append(candidate)
+            except (ValueError, TypeError):
+                pass
+
+        var_to_bone[var_name] = {
+            'name': bone_name, 'pivot': pivot, 'rotation': rotation, 'cubes': cubes,
+        }
+        var_to_parent_var[var_name] = parent_var
+
+    def _abs_pivot(var: str, depth: int = 0) -> List[float]:
+        if depth > 8 or var not in var_to_parent_var:
+            return var_to_bone.get(var, {}).get('pivot', [0.0, 0.0, 0.0])
+        pv = var_to_parent_var[var]
+        if pv == root_var:
+            return var_to_bone[var]['pivot']
+        parent_abs = _abs_pivot(pv, depth + 1)
+        child_rel  = var_to_bone[var]['pivot']
+        return [parent_abs[k] + child_rel[k] for k in range(3)]
+
+    gecko_bones = []
+    for var, bone in var_to_bone.items():
+        if bone['name'] == '__root__':
+            continue
+        abs_piv = _abs_pivot(var)
+        fixed_cubes = []
+        for cube in bone['cubes']:
+            rel = [cube['origin'][k] - bone['pivot'][k] for k in range(3)]
+            fixed_cubes.append({
+                "origin": [round(abs_piv[k] + rel[k], 4) for k in range(3)],
+                "size":   cube['size'],
+                "uv":     cube['uv'],
+            })
+        b: dict = {"name": bone['name'], "pivot": [round(x, 4) for x in abs_piv]}
+        if any(r != 0.0 for r in bone['rotation']):
+            b["rotation"] = [round(r, 4) for r in bone['rotation']]
+        pv2 = var_to_parent_var.get(var)
+        if pv2 and pv2 != root_var and pv2 in var_to_bone:
+            pbn = var_to_bone[pv2]['name']
+            if pbn != '__root__':
+                b["parent"] = pbn
+        if fixed_cubes:
+            b["cubes"] = fixed_cubes
+        gecko_bones.append(b)
+
+    if not gecko_bones:
+        return None
+
+    geo_id = (
+        f"geometry.{sanitize_identifier(namespace)}"
+        f".{sanitize_identifier(entity_name or model_name)}"
+    )
+    return {
+        "format_version": "1.12.0",
+        "minecraft:geometry": [{
+            "description": {
+                "identifier":            geo_id,
+                "texture_width":         tex_w,
+                "texture_height":        tex_h,
+                "visible_bounds_width":  2,
+                "visible_bounds_height": 2,
+                "visible_bounds_offset": [0, 1, 0],
+            },
+            "bones": gecko_bones,
+        }],
+    }
+
+
 def try_convert_model_from_jar(jar, file_path: str, resource_pack: str) -> bool:
     """
     Try to read a vanilla model JSON from the JAR, convert it to GeckoLib geometry,
@@ -894,6 +1346,539 @@ def try_convert_model_from_jar(jar, file_path: str, resource_pack: str) -> bool:
     safe_write_json(out_path, geckolib_data)
     print(f"[model-convert] Converted vanilla model -> GeckoLib: {file_path} -> {out_path}")
     return True
+
+
+def convert_modelbase_to_geckolib(
+    java_code: str,
+    model_name: str,
+    namespace: str,
+    entity_name: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Convert old-style Java entity models that use the ModelRenderer / AdvancedModelBox
+    / ModelPart constructor API to GeckoLib .geo.json.
+
+    This covers:
+      • Vanilla pre-1.17  ModelRenderer(this, u, v) / new ModelRenderer(this)
+      • Forge/NeoForge     ModelRenderer with texOffset().addBox()
+      • Citadel library    AdvancedModelBox(this, "name") used by Alex's Mobs etc.
+      • Any library that wraps the same pattern (setRotationPoint, addBox, addChild,
+        setRotationAngle / rotateAngleX|Y|Z)
+
+    Handles:
+      • texWidth / texHeight field assignments
+      • setRotationPoint(x, y, z)         — pivot in model space
+      • setTextureOffset(u, v)            — UV offset before addBox
+      • texOffset(u, v)                   — alternative UV call
+      • addBox(x, y, z, sx, sy, sz, ...)  — cube relative to pivot
+      • setRotationAngle(box, x, y, z)    — explicit rotation helper call (radians)
+      • box.rotateAngleX = v              — direct field assignment (radians)
+      • parent.addChild(child)            — parent-child wiring
+      • new AdvancedModelBox(this, "name") / new ModelRenderer(this, u, v)
+
+    Returns None if no recognisable constructor-style model content is found.
+    """
+
+    # ── Quick-reject: must look like a constructor-built model ────────────────
+    # At minimum we need setRotationPoint OR addBox plus addChild or addBox calls
+    if 'setRotationPoint' not in java_code and 'addBox' not in java_code:
+        return None
+    # Must not be a pure LayerDefinition file (handled by convert_layerdefinition_to_geckolib)
+    if 'addOrReplaceChild' in java_code and 'setRotationPoint' not in java_code:
+        return None
+
+    # ── 1. Texture dimensions ─────────────────────────────────────────────────
+    tex_w, tex_h = 64, 64
+    for pat in [
+        r'this\.texWidth\s*=\s*(\d+)',
+        r'textureWidth\s*=\s*(\d+)',
+        r'this\.xTexSize\s*=\s*(\d+)',
+    ]:
+        m = re.search(pat, java_code)
+        if m:
+            tex_w = int(m.group(1))
+            break
+    for pat in [
+        r'this\.texHeight\s*=\s*(\d+)',
+        r'textureHeight\s*=\s*(\d+)',
+        r'this\.yTexSize\s*=\s*(\d+)',
+    ]:
+        m = re.search(pat, java_code)
+        if m:
+            tex_h = int(m.group(1))
+            break
+
+    # ── 2. Find the constructor (or init method) body ─────────────────────────
+    # Try the class constructor first, then any method named init / registerParts
+    ctor_body = None
+    cls_name_for_ctor = extract_class_name(java_code)
+    if cls_name_for_ctor:
+        ctor_body = _extract_method_body(java_code, [cls_name_for_ctor])
+    if not ctor_body:
+        ctor_body = _extract_method_body(java_code,
+            ['init', 'registerParts', 'buildModel', 'setupModel', 'defineModel'])
+    if not ctor_body:
+        # Fall back to the whole file — messy but better than nothing
+        ctor_body = java_code
+
+    # ── 3. Build var→bone-name map from box declarations ─────────────────────
+    # Patterns:
+    #   this.body = new AdvancedModelBox(this, "body")
+    #   this.head = new ModelRenderer(this)
+    #   ModelRenderer head = new ModelRenderer(this)
+    var_to_name: Dict[str, str] = {}
+
+    # AdvancedModelBox / similar with explicit string name
+    for m in re.finditer(
+        r'(?:this\.)?(\w+)\s*=\s*new\s+(?:AdvancedModelBox|ExtendedModelRenderer'
+        r'|ModelBoxRenderer|CubeRenderer|AModelRenderer)\s*\([^,)]*,\s*["\']([^"\']+)["\']',
+        ctor_body
+    ):
+        var_to_name[m.group(1)] = m.group(2)
+
+    # ModelRenderer(this) or ModelRenderer(this, u, v) — use variable name as bone name
+    for m in re.finditer(
+        r'(?:this\.)?(\w+)\s*=\s*new\s+(?:ModelRenderer|ModelPart)\s*\(',
+        ctor_body
+    ):
+        vname = m.group(1)
+        if vname not in var_to_name:
+            var_to_name[vname] = vname  # variable name becomes bone name
+
+    # Also pick up any field that was declared but assigned elsewhere:
+    # new AdvancedModelBox(this, "boneName")  (no leading assignment captured above)
+    for m in re.finditer(
+        r'new\s+(?:AdvancedModelBox|ModelRenderer)\s*\(\s*this\s*,\s*["\']([^"\']+)["\']',
+        ctor_body
+    ):
+        # try to find which variable this was assigned to
+        # look backwards for `this.X =` or `X =` in a small window
+        window = ctor_body[max(0, m.start()-80):m.start()]
+        am = re.search(r'(?:this\.)?(\w+)\s*=\s*$', window.rstrip())
+        if am:
+            var_to_name[am.group(1)] = m.group(1)
+
+    if not var_to_name:
+        return None
+
+    # ── 4. Per-variable: pivot, UV, rotation, cubes ───────────────────────────
+    var_pivot:    Dict[str, List[float]] = {}
+    var_rotation: Dict[str, List[float]] = {}
+    var_cubes:    Dict[str, list]        = {}
+    var_parent:   Dict[str, str]         = {}
+
+    for var in var_to_name:
+        # setRotationPoint
+        pat_rp = (
+            rf'(?:this\.)?{re.escape(var)}\.setRotationPoint\s*\('
+            rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
+        )
+        m = re.search(pat_rp, ctor_body)
+        if m:
+            var_pivot[var] = [
+                _pjf(m.group(1)), _pjf(m.group(2)), _pjf(m.group(3))
+            ]
+        else:
+            var_pivot[var] = [0.0, 0.0, 0.0]
+
+        # Rotations —————————————————————————————————————————————————
+        rx, ry, rz = 0.0, 0.0, 0.0
+
+        # setRotationAngle(this.var, x, y, z) helper call (radians)
+        pat_sra = (
+            rf'setRotationAngle\s*\(\s*(?:this\.)?{re.escape(var)}'
+            rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
+        )
+        m = re.search(pat_sra, ctor_body)
+        if m:
+            rx = math.degrees(_pjf(m.group(1)))
+            ry = math.degrees(_pjf(m.group(2)))
+            rz = math.degrees(_pjf(m.group(3)))
+        else:
+            # Direct field assignments: this.var.rotateAngleX = -1.5707F;
+            for axis, idx in (('X', 0), ('Y', 1), ('Z', 2)):
+                pat_ax = (
+                    rf'(?:this\.)?{re.escape(var)}\.rotateAngle{axis}\s*=\s*({_FLOAT_EXPR_RE})'
+                )
+                am = re.search(pat_ax, ctor_body)
+                if am:
+                    deg = _eval_rot_expr(am.group(1))
+                    if deg is not None:
+                        if idx == 0: rx = deg
+                        elif idx == 1: ry = deg
+                        else: rz = deg
+
+        var_rotation[var] = [round(rx, 4), round(ry, 4), round(rz, 4)]
+
+        # Cubes ——————————————————————————————————————————————————————
+        cubes: list = []
+        cur_u, cur_v = 0, 0
+
+        # setTextureOffset(u, v) OR texOffset(u, v) followed immediately by .addBox(...)
+        # Scan all occurrences on this variable
+        uv_pats = [
+            rf'(?:this\.)?{re.escape(var)}\.setTextureOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
+            rf'(?:this\.)?{re.escape(var)}\.texOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
+        ]
+        for uv_pat in uv_pats:
+            for uvm in re.finditer(uv_pat, ctor_body):
+                cur_u = int(uvm.group(1))
+                cur_v = int(uvm.group(2))
+                # Find the addBox call that follows on the same chain or same statement
+                after = ctor_body[uvm.end():uvm.end() + 300]
+                ab = re.match(
+                    r'\s*(?:\.\s*)?addBox\s*\('
+                    rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
+                    rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
+                    after
+                )
+                if ab:
+                    try:
+                        ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
+                        sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
+                        pivot = var_pivot.get(var, [0., 0., 0.])
+                        cubes.append({
+                            "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
+                            "size":   [sx, sy, sz],
+                            "uv":     [cur_u, cur_v],
+                        })
+                    except (ValueError, TypeError):
+                        pass
+
+        # Bare addBox calls directly on the variable (no preceding texOffset)
+        for ab in re.finditer(
+            rf'(?:this\.)?{re.escape(var)}\.addBox\s*\('
+            rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
+            rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
+            ctor_body
+        ):
+            try:
+                ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
+                sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
+                pivot = var_pivot.get(var, [0., 0., 0.])
+                candidate = {
+                    "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
+                    "size":   [sx, sy, sz],
+                    "uv":     [cur_u, cur_v],
+                }
+                if candidate not in cubes:
+                    cubes.append(candidate)
+            except (ValueError, TypeError):
+                pass
+
+        var_cubes[var] = cubes
+
+    # ── 5. Parent-child wiring from addChild calls ────────────────────────────
+    for m in re.finditer(
+        r'(?:this\.)?(\w+)\.addChild\s*\(\s*(?:this\.)?(\w+)\s*\)',
+        ctor_body
+    ):
+        parent_var = m.group(1)
+        child_var  = m.group(2)
+        if child_var in var_to_name and parent_var in var_to_name:
+            var_parent[child_var] = parent_var
+
+    # Identify root bones (no parent, or parented to 'root' / themselves)
+    all_children = set(var_parent.keys())
+
+    # ── 6. Compute absolute pivots ────────────────────────────────────────────
+    def _abs_piv(var: str, depth: int = 0) -> List[float]:
+        if depth > 10:
+            return var_pivot.get(var, [0., 0., 0.])
+        p = var_parent.get(var)
+        if p is None or p == var:
+            return var_pivot.get(var, [0., 0., 0.])
+        parent_abs = _abs_piv(p, depth + 1)
+        rel        = var_pivot.get(var, [0., 0., 0.])
+        return [parent_abs[i] + rel[i] for i in range(3)]
+
+    # ── 7. Build GeckoLib bones ───────────────────────────────────────────────
+    gecko_bones = []
+    for var, bone_name in var_to_name.items():
+        abs_piv = _abs_piv(var)
+        pivot   = var_pivot.get(var, [0., 0., 0.])
+
+        # Fix cube origins to be absolute
+        fixed_cubes = []
+        for cube in var_cubes.get(var, []):
+            # cube origin was stored as pivot+local — subtract pivot, add abs_piv
+            rel = [cube['origin'][i] - pivot[i] for i in range(3)]
+            fixed_cubes.append({
+                "origin": [round(abs_piv[i] + rel[i], 4) for i in range(3)],
+                "size":   cube['size'],
+                "uv":     cube['uv'],
+            })
+
+        b: dict = {
+            "name":  bone_name,
+            "pivot": [round(x, 4) for x in abs_piv],
+        }
+        rot = var_rotation.get(var, [0., 0., 0.])
+        if any(r != 0. for r in rot):
+            b["rotation"] = rot
+        p_var = var_parent.get(var)
+        if p_var and p_var in var_to_name:
+            b["parent"] = var_to_name[p_var]
+        if fixed_cubes:
+            b["cubes"] = fixed_cubes
+        gecko_bones.append(b)
+
+    if not gecko_bones:
+        return None
+
+    geo_id = (
+        f"geometry.{sanitize_identifier(namespace)}"
+        f".{sanitize_identifier(entity_name or model_name)}"
+    )
+    return {
+        "format_version": "1.12.0",
+        "minecraft:geometry": [{
+            "description": {
+                "identifier":            geo_id,
+                "texture_width":         tex_w,
+                "texture_height":        tex_h,
+                "visible_bounds_width":  2,
+                "visible_bounds_height": 2,
+                "visible_bounds_offset": [0, 1, 0],
+            },
+            "bones": gecko_bones,
+        }],
+    }
+
+
+# Float-literal regex helpers used by convert_modelbase_to_geckolib
+_FLOAT_RE      = r'[-+]?[0-9]*\.?[0-9]+[FfDdLl]?'
+_FLOAT_EXPR_RE = r'[-+]?(?:\(float\)\s*)?[A-Za-z0-9_.*+\-/()\s]+'
+
+def _pjf(s: str) -> float:
+    """Parse a Java float/double literal to Python float."""
+    v = _parse_java_float(str(s).strip())
+    return v if v is not None else 0.0
+
+
+def scan_and_convert_layerdefinition_models(
+    java_files: Dict[str, str],
+    namespace: str,
+) -> Dict[str, str]:
+    """
+    Scan all Java source files for entity model classes and convert them to
+    GeckoLib .geo.json files in RP_FOLDER/geometry/.
+
+    Handles three model styles:
+      1. Modern LayerDefinition / MeshDefinition / PartDefinition  (1.17+)
+      2. Old-style ModelRenderer / AdvancedModelBox constructor API  (pre-1.17,
+         Citadel/Alex's Mobs, many popular hand-crafted Forge mods)
+      3. Any class that mixes both
+
+    Returns {model_class_name: geometry_identifier}.
+    """
+    # Superclasses that signal a Java entity model class
+    MODEL_SUPER_PAT = re.compile(
+        r'extends\s+(?:'
+        r'EntityModel|HierarchicalModel|AgeableMobModel'
+        r'|LayerDefinition|BookOpenModel|ArmedModel|HeadedModel|SkullModelBase'
+        r'|AdvancedEntityModel|ExtendedEntityModel|CitadelEntityModel'   # Citadel
+        r'|BipedModel|QuadrupedModel|AgeableModel'                        # vanilla legacy
+        r'|GeoModel|GeoLayerRenderer'                                     # GeckoLib base (skip)
+        r')[^{;]*',
+        re.DOTALL
+    )
+
+    # Quick-accept signals for constructor-style models that don't extend a known base
+    CTOR_SIGNALS = ('setRotationPoint', 'addBox', 'addChild', 'setTextureOffset',
+                    'texOffset', 'rotateAngleX', 'rotateAngleY', 'rotateAngleZ',
+                    'setRotationAngle', 'AdvancedModelBox', 'ModelRenderer')
+
+    result: Dict[str, str] = {}
+    converted = 0
+
+    for path, code in java_files.items():
+        fname = os.path.basename(path).lower()
+
+        # Skip renderer, entity, and non-model files early
+        if any(k in fname for k in ('renderer', 'entity', 'layer', 'event',
+                                     'handler', 'registry', 'screen', 'gui',
+                                     'packet', 'provider', 'capability')):
+            # Only keep if it explicitly looks like a model file
+            if 'Model' not in os.path.splitext(os.path.basename(path))[0]:
+                continue
+
+        # Must have some model-like content
+        is_layerdef   = ('LayerDefinition' in code or 'MeshDefinition' in code
+                         or 'addOrReplaceChild' in code)
+        is_ctor_model = any(sig in code for sig in CTOR_SIGNALS)
+        if not is_layerdef and not is_ctor_model:
+            continue
+
+        # Must extend a known model base OR have convincing constructor signals
+        extends_model = bool(MODEL_SUPER_PAT.search(code))
+        if not extends_model:
+            # Require at least 3 ctor signals to reduce false positives
+            sig_count = sum(1 for s in CTOR_SIGNALS if s in code)
+            if sig_count < 3:
+                continue
+
+        # Skip pure GeckoLib model classes (they already have .geo.json)
+        if ('GeoModel' in code or 'IAnimatable' in code
+                or 'getModelResource' in code or 'getAnimationResource' in code):
+            continue
+
+        cls_name   = extract_class_name(code) or os.path.splitext(os.path.basename(path))[0]
+        model_stem = sanitize_identifier(cls_name)
+        out_path   = os.path.join(RP_FOLDER, "geometry", f"{model_stem}.geo.json")
+
+        # Already converted — just register
+        if os.path.exists(out_path):
+            try:
+                with open(out_path, encoding='utf-8') as fh:
+                    existing = json.load(fh)
+                geos = existing.get('minecraft:geometry', [])
+                if geos:
+                    geo_id = (geos[0].get('description') or {}).get('identifier', '')
+                    if geo_id:
+                        result[cls_name] = geo_id
+            except Exception:
+                pass
+            continue
+
+        # Try LayerDefinition converter first, then constructor-style converter
+        geo_data: Optional[dict] = None
+        method_used = ''
+        if is_layerdef:
+            geo_data = convert_layerdefinition_to_geckolib(code, cls_name, namespace)
+            if geo_data:
+                method_used = 'layerdef'
+        if geo_data is None and is_ctor_model:
+            geo_data = convert_modelbase_to_geckolib(code, cls_name, namespace)
+            if geo_data:
+                method_used = 'modelbase'
+
+        if geo_data is None:
+            continue
+
+        try:
+            os.makedirs(os.path.join(RP_FOLDER, "geometry"), exist_ok=True)
+            safe_write_json(out_path, geo_data)
+            geo_id = geo_data['minecraft:geometry'][0]['description']['identifier']
+            result[cls_name] = geo_id
+            converted += 1
+            print(f"[{method_used}] Converted {cls_name} -> {model_stem}.geo.json  ({geo_id})")
+        except Exception as e:
+            print(f"[model-convert] Failed to write {out_path}: {e}")
+
+    if converted:
+        print(f"[model-convert] Converted {converted} Java model class(es) to GeckoLib geometry")
+    return result
+
+
+# ── Module-level cache: layerdef model class -> geometry identifier ────────────
+# Populated by scan_and_convert_layerdefinition_models() during prescan.
+_LAYERDEF_GEO_MAP: Dict[str, str] = {}
+
+
+def normalise_all_geometry_to_geckolib(resource_pack: str, namespace: str) -> int:
+    """
+    Post-extraction sweep: find every model-like JSON anywhere under resource_pack
+    (rp/models/, rp/geometry/, loose .geo.json files) and make sure it ends up as
+    a valid GeckoLib .geo.json in rp/geometry/.
+
+    Three cases:
+      A) Already GeckoLib format (has "minecraft:geometry" key) anywhere
+         → copy/move to rp/geometry/ with normalised filename if not already there.
+      B) Vanilla/Blockbench elements format (has "elements" or "groups" key)
+         → convert via convert_vanilla_model_to_geckolib → write to rp/geometry/.
+      C) Files in rp/models/ that are neither (blockstate, item override, etc.)
+         → ignore (no Bedrock equivalent).
+
+    Returns the number of files written/normalised.
+    """
+    geom_dir = os.path.join(resource_pack, "geometry")
+    os.makedirs(geom_dir, exist_ok=True)
+
+    written = 0
+    seen_stems: set = set()   # avoid duplicate output files
+
+    # Directories to sweep (order: geometry first so we don't double-convert)
+    sweep_dirs = [
+        os.path.join(resource_pack, "geometry"),
+        os.path.join(resource_pack, "models"),
+    ]
+
+    for sweep_dir in sweep_dirs:
+        if not os.path.isdir(sweep_dir):
+            continue
+        for dirpath, _dirs, files in os.walk(sweep_dir):
+            for fname in files:
+                lower = fname.lower()
+                if not lower.endswith(".json") and not lower.endswith(".geo.json"):
+                    continue
+                src = os.path.join(dirpath, fname)
+                try:
+                    with open(src, "r", encoding="utf-8", errors="ignore") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                # ── Case A: already GeckoLib ─────────────────────────────────
+                if "minecraft:geometry" in data:
+                    # Ensure it lives in geometry/ with a .geo.json extension
+                    base = re.sub(r'\.geo(\.json)?$', '', fname, flags=re.I)
+                    base = re.sub(r'\.json$', '', base, flags=re.I)
+                    stem = sanitize_identifier(base) or sanitize_identifier(fname)
+                    dest_name = stem + ".geo.json"
+                    dest = os.path.join(geom_dir, dest_name)
+                    if os.path.abspath(src) != os.path.abspath(dest) and stem not in seen_stems:
+                        # Normalise geometry identifier(s) to include namespace
+                        geos = data.get("minecraft:geometry", [])
+                        if isinstance(geos, list):
+                            for g in geos:
+                                desc = g.get("description") or {}
+                                ident = desc.get("identifier", "")
+                                if ident and not ident.startswith(f"geometry.{namespace}"):
+                                    # keep whatever identifier it already has — don't rename
+                                    pass
+                        safe_write_json(dest, data)
+                        seen_stems.add(stem)
+                        written += 1
+                        print(f"[geo-sweep] GeckoLib → rp/geometry/{dest_name}")
+                    else:
+                        seen_stems.add(stem)
+                    continue
+
+                # ── Case B: vanilla/Blockbench elements format ────────────────
+                if "elements" in data or "groups" in data:
+                    base = re.sub(r'\.json$', '', fname, flags=re.I)
+                    stem = sanitize_identifier(base) or sanitize_identifier(fname)
+                    dest_name = stem + ".geo.json"
+                    dest = os.path.join(geom_dir, dest_name)
+                    if stem in seen_stems or os.path.exists(dest):
+                        seen_stems.add(stem)
+                        continue
+                    try:
+                        converted = convert_vanilla_model_to_geckolib(data, stem)
+                        # Stamp the identifier with namespace
+                        geos = converted.get("minecraft:geometry", [])
+                        if geos:
+                            desc = geos[0].setdefault("description", {})
+                            current_id = desc.get("identifier", "")
+                            if not current_id or current_id == f"geometry.{stem}":
+                                desc["identifier"] = f"geometry.{namespace}.{stem}"
+                        safe_write_json(dest, converted)
+                        seen_stems.add(stem)
+                        written += 1
+                        print(f"[geo-sweep] Vanilla→GeckoLib → rp/geometry/{dest_name}")
+                    except Exception as e:
+                        print(f"[geo-sweep] Conversion failed for {src}: {e}")
+                    continue
+
+                # Case C: not a model JSON (blockstate, item override, etc.) — skip
+
+    if written:
+        print(f"[geo-sweep] Normalised {written} model file(s) to rp/geometry/")
+    return written
 
 
 def copy_geckolib_animations_from_jar(jar_path: str, resource_pack: str):
@@ -931,25 +1916,26 @@ def resolve_texture_reference(namespace: str, texture_hint: Optional[str], kind_
     ns = sanitize_identifier(namespace) or "converted"
     if texture_hint:
         candidate = texture_hint.split(":")[-1]
-        candidate = candidate.replace(".png", "")
-        candidate = candidate.strip("/")
-        # try with kind_hint prefix
-        probe = f"{kind_hint}/{candidate}"
-        if rp_texture_exists(probe):
-            return f"{ns}:{probe}"
-        if rp_texture_exists(candidate):
-            return f"{ns}:{candidate}"
-        # fall back to sanitized candidate
-        cand_s = sanitize_identifier(candidate)
-        return f"{ns}:{kind_hint}/{cand_s}"
+        candidate = candidate.replace(".png", "").strip("/")
+        # Strip leading 'textures/' — RP client-entity refs never include that prefix
+        if candidate.startswith("textures/"):
+            candidate = candidate[len("textures/"):]
+        # Probe: bare, with kind_hint prefix, and just the basename under kind_hint
+        for probe in [
+            candidate,
+            f"{kind_hint}/{candidate}",
+            f"{kind_hint}/{os.path.basename(candidate)}",
+        ]:
+            if rp_texture_exists(probe):
+                return f"{ns}:{probe}"
+        # Best-effort fallback
+        return f"{ns}:{candidate if '/' in candidate else kind_hint + '/' + sanitize_identifier(candidate)}"
     if fallback_name:
-        probe = f"{kind_hint}/{fallback_name}"
-        if rp_texture_exists(probe):
-            return f"{ns}:{probe}"
-        if rp_texture_exists(fallback_name):
-            return f"{ns}:{fallback_name}"
+        for probe in [f"{kind_hint}/{fallback_name}", fallback_name]:
+            if rp_texture_exists(probe):
+                return f"{ns}:{probe}"
         return f"{ns}:{kind_hint}/{sanitize_identifier(fallback_name)}"
-    return f"{ns}:{kind_hint}/{sanitize_identifier(fallback_name or 'missing_texture')}"
+    return f"{ns}:{kind_hint}/missing_texture"
 
 def texture_ref_to_rp_path(texture_ref: Optional[str], default_kind: str = "entity") -> str:
     """
@@ -1196,6 +2182,112 @@ def canonicalize_animation_id(raw: str, namespace: Optional[str] = None, entity_
         return f"animation.{ns}.{bare}"
     return f"animation.{bare}"
 
+# ── RP asset index ─────────────────────────────────────────────────────────────
+
+def build_rp_asset_index():
+    """
+    Walk RP_FOLDER and index every texture (.png) and geometry (.geo.json) file.
+    Call AFTER copy_assets_from_jar and normalisation so the index is complete.
+    Populates _RP_ASSET_INDEX in-place.
+    """
+    global _RP_ASSET_INDEX
+    textures: list = []
+    geometry: list = []
+
+    # ── textures ────────────────────────────────────────────────────────────
+    tex_root = os.path.join(RP_FOLDER, "textures")
+    if os.path.isdir(tex_root):
+        for dirpath, _, filenames in os.walk(tex_root):
+            for fname in filenames:
+                if fname.lower().endswith(".png"):
+                    abs_path = os.path.join(dirpath, fname)
+                    rel = os.path.relpath(abs_path, tex_root).replace("\\", "/")
+                    rel_no_ext = os.path.splitext(rel)[0]
+                    textures.append((rel_no_ext, abs_path))
+
+    # ── geometry ────────────────────────────────────────────────────────────
+    for geo_root in [os.path.join(RP_FOLDER, "models"), os.path.join(RP_FOLDER, "geometry")]:
+        if not os.path.isdir(geo_root):
+            continue
+        for dirpath, _, filenames in os.walk(geo_root):
+            for fname in filenames:
+                if not (fname.lower().endswith(".geo.json") or fname.lower().endswith(".json")):
+                    continue
+                abs_path = os.path.join(dirpath, fname)
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        data = json.load(fh)
+                    geos = data.get("minecraft:geometry", [])
+                    extracted = False
+                    if isinstance(geos, list):
+                        for g in geos:
+                            ident = (g.get("description") or {}).get("identifier", "")
+                            if ident:
+                                geometry.append((ident, abs_path))
+                                extracted = True
+                    if not extracted:
+                        stem = re.sub(r'\.geo(\.json)?$', '', fname, flags=re.I)
+                        geometry.append((f"geometry.{sanitize_identifier(stem)}", abs_path))
+                except Exception:
+                    stem = re.sub(r'\.geo(\.json)?$', '', fname, flags=re.I)
+                    geometry.append((f"geometry.{sanitize_identifier(stem)}", abs_path))
+
+    _RP_ASSET_INDEX["textures"] = textures
+    _RP_ASSET_INDEX["geometry"] = geometry
+    print(f"[index] Indexed {len(textures)} texture(s) and {len(geometry)} geometry model(s)")
+
+
+# ── Fuzzy name-similarity helpers ──────────────────────────────────────────────
+
+def _camel_tokens(s: str) -> set:
+    """'MyDragonEntity' → {'my', 'dragon', 'entity'}; also splits on underscores."""
+    s = re.sub(r'([A-Z])', r'_\1', s).lower().strip("_")
+    return {t for t in re.split(r'[_\s\-]+', s) if len(t) > 1}
+
+
+_ASSET_NOISE = frozenset({
+    "entity", "mob", "model", "geo", "texture", "renderer", "render",
+    "layer", "type", "base", "abstract", "common", "generic",
+})
+
+
+def _asset_score(entity_tokens: set, candidate_stem: str) -> float:
+    """
+    Return a [0.0, 1.0] similarity score between a set of entity-name tokens
+    and a filesystem stem string.  Higher → better match.
+    """
+    cand_base = os.path.basename(candidate_stem)
+    cand_tokens = _camel_tokens(cand_base) | set(cand_base.split("_"))
+    cand_tokens = {t for t in cand_tokens if len(t) > 1}
+
+    if not entity_tokens or not cand_tokens:
+        return 0.0
+
+    et = entity_tokens - _ASSET_NOISE or entity_tokens
+    ct = cand_tokens - _ASSET_NOISE or cand_tokens
+
+    shared = et & ct
+    if not shared:
+        # substring containment fallback
+        ent_str = "".join(sorted(et))
+        cand_str = "".join(sorted(ct))
+        if ent_str in cand_str or cand_str in ent_str:
+            return 0.38
+        # partial — longest token in common
+        for e in sorted(et, key=len, reverse=True):
+            if len(e) >= 4:
+                for c in ct:
+                    if e in c or c in e:
+                        return 0.32
+        return 0.0
+
+    precision = len(shared) / len(ct) if ct else 0.0
+    recall    = len(shared) / len(et) if et else 0.0
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
 def load_geometry_identifiers() -> Tuple[Dict[str, str], Dict[Tuple[Optional[str], Optional[str]], str]]:
     map_by_file = {}
     map_by_ns_name = {}
@@ -1366,6 +2458,147 @@ def find_model_geometry_in_code(java_code: str) -> Optional[Tuple[Optional[str],
         return (ns.lower() if ns else None, sanitize_identifier(name))
     return None
 
+
+# ── Renderer / Model pre-scan map ─────────────────────────────────────────────
+# Populated by build_renderer_entity_map() at startup.
+# Maps entity simple-class-name → {"renderer": cls, "model": cls, "renderer_code": str, "model_code": str}
+_RENDERER_MAP: Dict[str, Dict] = {}
+
+
+def build_renderer_entity_map():
+    """
+    Scan every Java source file to build a map from entity class name to its
+    renderer class and model class.
+
+    Patterns covered:
+      EntityRenderers.register(EntityType.MY_ENTITY, MyRenderer::new)
+      ClientRegistry.bindEntityRenderer(MY_ENTITY_TYPE, ctx -> new MyRenderer(ctx))
+      class MyRenderer extends GeoEntityRenderer<MyEntity>
+      class MyRenderer extends MobRenderer<MyEntity, MyModel<MyEntity>>
+      class MyRenderer extends EntityRenderer<MyEntity>
+      class MyModel extends GeoModel<MyEntity>
+      class MyModel extends LayerDefinition / EntityModel<MyEntity>
+      getModelResource() / getTextureResource() in any class referencing entity
+    """
+    global _RENDERER_MAP
+    _RENDERER_MAP = {}
+
+    # ── Pass 1: collect class declarations and what entity they handle ─────────
+    # renderer_cls → entity_cls (from `extends XxxRenderer<MyEntity>`)
+    renderer_to_entity: Dict[str, str] = {}
+    # model_cls → entity_cls (from `extends XxxModel<MyEntity>`)
+    model_to_entity: Dict[str, str] = {}
+    # entity_cls → renderer_cls (from registration calls)
+    entity_to_renderer: Dict[str, str] = {}
+    # class simple name → source code
+    cls_to_code: Dict[str, str] = {}
+    cls_to_path: Dict[str, str] = {}
+
+    for path, code in _ALL_JAVA_FILES.items():
+        cls = extract_class_name(code)
+        if not cls:
+            continue
+        cls_to_code[cls] = code
+        cls_to_path[cls] = path
+
+        # `class Foo extends GeoEntityRenderer<BarEntity>`
+        # `class Foo extends MobRenderer<BarEntity, BarModel<BarEntity>>`
+        # `class Foo extends EntityRenderer<BarEntity>`
+        m = re.search(
+            r'\bclass\s+(\w+)\s+extends\s+\w*(?:Renderer|Render)\w*\s*<\s*(\w+)',
+            code
+        )
+        if m:
+            renderer_cls, entity_arg = m.group(1), m.group(2)
+            renderer_to_entity[renderer_cls] = entity_arg
+
+        # `class Foo extends GeoModel<BarEntity>`
+        # `class Foo extends EntityModel<BarEntity>`
+        m2 = re.search(
+            r'\bclass\s+(\w+)\s+extends\s+\w*(?:Model|GeoModel)\w*\s*<\s*(\w+)',
+            code
+        )
+        if m2:
+            model_cls, entity_arg = m2.group(1), m2.group(2)
+            model_to_entity[model_cls] = entity_arg
+
+        # Registration patterns ─────────────────────────────────────────────────
+        # EntityRenderers.register(ModEntities.MY_ENTITY, MyRenderer::new)
+        for m3 in re.finditer(
+            r'EntityRenderers\s*\.\s*register\s*\(\s*(\w+(?:\.\w+)*)\s*,\s*(\w+)\s*::',
+            code
+        ):
+            etype_expr, renderer_cls = m3.group(1), m3.group(2)
+            # etype_expr like "ModEntities.MY_ENTITY" or "EntityType.ZOMBIE"
+            etype_simple = etype_expr.split(".")[-1]          # "MY_ENTITY"
+            entity_to_renderer[etype_simple] = renderer_cls
+            entity_to_renderer[etype_simple.lower()] = renderer_cls
+
+        # RenderingRegistry.registerEntityRenderingHandler(TYPE, ctx -> new MyRenderer(ctx))
+        for m4 in re.finditer(
+            r'registerEntityRenderingHandler\s*\(\s*(\w+(?:\.\w+)*)\s*,\s*\w+\s*->\s*new\s+(\w+)',
+            code
+        ):
+            etype_expr, renderer_cls = m4.group(1), m4.group(2)
+            etype_simple = etype_expr.split(".")[-1]
+            entity_to_renderer[etype_simple] = renderer_cls
+            entity_to_renderer[etype_simple.lower()] = renderer_cls
+
+        # ClientRegistry.bindEntityRenderer(TYPE.class, MyRenderer.class) (old Forge)
+        for m5 in re.finditer(
+            r'bindEntityRenderer\s*\(\s*(\w+)\.class\s*,\s*(\w+)\.class',
+            code
+        ):
+            entity_to_renderer[m5.group(1)] = m5.group(2)
+
+    # ── Pass 2: also map renderer → model (from renderer constructor or field) ─
+    renderer_to_model: Dict[str, str] = {}
+    for renderer_cls, rcode in {c: cls_to_code[c] for c in renderer_to_entity if c in cls_to_code}.items():
+        # super(ctx, new MyModel())  or  super(ctx, new MyModel<>(ctxA))
+        m = re.search(r'super\s*\([^)]*new\s+(\w+)', rcode)
+        if m:
+            renderer_to_model[renderer_cls] = m.group(1)
+        # this.model = new MyModel(...)
+        m2 = re.search(r'this\.model\s*=\s*new\s+(\w+)', rcode)
+        if m2:
+            renderer_to_model[renderer_cls] = m2.group(1)
+
+    # ── Build final map keyed by entity class name ─────────────────────────────
+    # We want to look up by both simple class name AND registry-name-derived name
+    def _put(entity_cls: str, renderer_cls: Optional[str], model_cls: Optional[str]):
+        if not entity_cls:
+            return
+        entry = _RENDERER_MAP.setdefault(entity_cls, {})
+        if renderer_cls and "renderer" not in entry:
+            entry["renderer"] = renderer_cls
+            entry["renderer_code"] = cls_to_code.get(renderer_cls, "")
+        if model_cls and "model" not in entry:
+            entry["model"] = model_cls
+            entry["model_code"] = cls_to_code.get(model_cls, "")
+
+    # renderer_to_entity → direct
+    for renderer_cls, entity_cls in renderer_to_entity.items():
+        model_cls = renderer_to_model.get(renderer_cls)
+        _put(entity_cls, renderer_cls, model_cls)
+        # also index by renderer so entity code that mentions renderer can look it up
+        _put(renderer_cls, renderer_cls, model_cls)
+
+    # model_to_entity → direct
+    for model_cls, entity_cls in model_to_entity.items():
+        _put(entity_cls, None, model_cls)
+
+    # entity_to_renderer registration calls
+    for etype_key, renderer_cls in entity_to_renderer.items():
+        # etype_key might be "MY_ENTITY" in caps — convert to CamelCase guess
+        camel = "".join(w.capitalize() for w in etype_key.lower().split("_"))
+        model_cls = renderer_to_model.get(renderer_cls)
+        _put(camel,    renderer_cls, model_cls)
+        _put(etype_key, renderer_cls, model_cls)
+
+    found = sum(1 for v in _RENDERER_MAP.values() if v.get("renderer") or v.get("model"))
+    print(f"[renderer-map] Mapped {found} entity→renderer/model relationship(s) from {len(_ALL_JAVA_FILES)} source files")
+
+
 def build_geckolib_mappings(java_root="."):
     java_files = read_all_java_files(java_root)
     class_to_path: Dict[str, str] = {}
@@ -1485,6 +2718,34 @@ def build_geckolib_mappings(java_root="."):
             entity_to_geometry[ent] = geom
             entity_to_model[ent] = model_cls
 
+    # ── LayerDefinition fallback: link entity -> model via renderer, then
+    #    look up the geometry we already converted from LayerDefinition source ──
+    global _LAYERDEF_GEO_MAP
+    if _LAYERDEF_GEO_MAP:
+        for renderer_cls, model_cls in renderer_model.items():
+            if model_cls in _LAYERDEF_GEO_MAP:
+                ent = renderer_entity.get(renderer_cls)
+                if ent and ent not in entity_to_geometry:
+                    geo_id = _LAYERDEF_GEO_MAP[model_cls]
+                    # Store as (namespace_hint, geo_name) tuple like GeckoLib entries
+                    parts = geo_id.split('.')
+                    ns_h  = parts[1] if len(parts) >= 3 else None
+                    nm_h  = '.'.join(parts[2:]) if len(parts) >= 3 else geo_id
+                    entity_to_geometry[ent] = (ns_h, nm_h)
+                    entity_to_model[ent]    = model_cls
+        # Also check by class name similarity for unmatched entities
+        for model_cls, geo_id in _LAYERDEF_GEO_MAP.items():
+            for ent_cls in renderer_entity.values():
+                if ent_cls not in entity_to_geometry:
+                    # e.g. DragonModel <-> DragonEntity
+                    mc_stem = re.sub(r'(?i)Model$', '', model_cls).lower()
+                    en_stem = re.sub(r'(?i)Entity$', '', ent_cls).lower()
+                    if mc_stem and en_stem and mc_stem == en_stem:
+                        parts = geo_id.split('.')
+                        ns_h  = parts[1] if len(parts) >= 3 else None
+                        nm_h  = '.'.join(parts[2:]) if len(parts) >= 3 else geo_id
+                        entity_to_geometry[ent_cls] = (ns_h, nm_h)
+
     return {
         "class_code_map": class_code_map,
         "class_to_path": class_to_path,
@@ -1499,48 +2760,181 @@ def build_geckolib_mappings(java_root="."):
 # Java parsing helpers, extractors, and converters
 # (most logic reused from earlier working script — kept intact)
 # -------------------------
-def extract_attributes_from_java(java_code: str):
-    # This is the exact physical order from the code you provided:
-    # 1. f_22279_ (0.3)
-    # 2. f_22276_ (1024.0)
-    # 3. f_22284_ (100.0)
-    # 4. f_22281_ (9.0)
-    # 5. f_22277_ (2048.0)
-    # 6. f_22278_ (1000.0)
-    
-    ORDER_MAPPING = [
-        "movement_speed",      # Slot 1
-        "follow_range",        # Slot 2
-        "health",              # Slot 3
-        "knockback_resistance",# Slot 4
-        "armor",               # Slot 5
-        "attack_damage"        # Slot 6
+# ── Attribute name -> Bedrock attribute key ───────────────────────────────────
+# Covers: vanilla Forge/NeoForge, Fabric (EntityAttributes.GENERIC_*),
+# hand-crafted mods using the Java constant names directly, and legacy MCP names.
+_JAVA_ATTR_NAME_MAP: Dict[str, str] = {
+    # MaxHealth / health
+    "MAX_HEALTH": "health",
+    "GENERIC_MAX_HEALTH": "health",
+    "maxHealth": "health",
+    "HEALTH": "health",
+    # Movement speed
+    "MOVEMENT_SPEED": "movement_speed",
+    "GENERIC_MOVEMENT_SPEED": "movement_speed",
+    "movementSpeed": "movement_speed",
+    "FLYING_SPEED": "movement_speed",
+    "SWIM_SPEED": "movement_speed",
+    # Attack
+    "ATTACK_DAMAGE": "attack_damage",
+    "GENERIC_ATTACK_DAMAGE": "attack_damage",
+    "attackDamage": "attack_damage",
+    "ATTACK_SPEED": "attack_speed",
+    "GENERIC_ATTACK_SPEED": "attack_speed",
+    "ATTACK_KNOCKBACK": "attack_knockback",
+    "GENERIC_ATTACK_KNOCKBACK": "attack_knockback",
+    # Follow / aggro range
+    "FOLLOW_RANGE": "follow_range",
+    "GENERIC_FOLLOW_RANGE": "follow_range",
+    "followRange": "follow_range",
+    # Defense
+    "ARMOR": "armor",
+    "GENERIC_ARMOR": "armor",
+    "ARMOR_TOUGHNESS": "armor_toughness",
+    "GENERIC_ARMOR_TOUGHNESS": "armor_toughness",
+    "KNOCKBACK_RESISTANCE": "knockback_resistance",
+    "GENERIC_KNOCKBACK_RESISTANCE": "knockback_resistance",
+    "knockbackResistance": "knockback_resistance",
+    # Misc
+    "LUCK": "luck",
+    "GENERIC_LUCK": "luck",
+    "HORSE_JUMP_STRENGTH": "jump_strength",
+    "ZOMBIE_SPAWN_REINFORCEMENTS": "spawn_reinforcements",
+    "SPAWN_REINFORCEMENTS_CHANCE": "spawn_reinforcements",
+}
+
+# SRG/intermediary obfuscated field name -> Bedrock attribute key
+# Used ONLY as last-resort fallback for decompiled obfuscated code.
+_SRG_ATTR_FIELD_MAP: Dict[str, str] = {
+    "f_22279_": "movement_speed",
+    "f_22276_": "follow_range",
+    "f_22284_": "health",
+    "f_22281_": "knockback_resistance",
+    "f_22277_": "armor",
+    "f_22278_": "attack_damage",
+    # Older SRG names
+    "m_6113_": "health",
+    "m_6114_": "follow_range",
+    "m_6115_": "movement_speed",
+    "m_6116_": "attack_damage",
+}
+
+
+def _parse_java_float(s: str) -> Optional[float]:
+    """Parse a Java float/double literal, stripping type suffixes."""
+    if s is None:
+        return None
+    cleaned = re.sub(r'[DdFfLl]$', '', str(s).strip())
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_attr_block(java_code: str) -> str:
+    """
+    Return the source snippet most likely to contain attribute declarations.
+    Searches for createAttributes / getDefaultAttributes / createMonsterAttributes
+    method bodies. Falls back to the entire file if nothing is found.
+    """
+    # Patterns for hand-crafted and Forge/NeoForge mods
+    method_patterns = [
+        r'(?:public\s+static\s+)?(?:AttributeSupplier|AttributeModifierMap|AttributeMap|Builder)\s*'
+        r'[\w.]*\s*createAttributes\s*\(\s*\)\s*\{',
+        r'(?:public\s+static\s+)?(?:AttributeSupplier|AttributeModifierMap|AttributeMap|Builder)\s*'
+        r'[\w.]*\s*getDefaultAttributes\s*\(\s*\)\s*\{',
+        r'(?:public\s+static\s+)?(?:AttributeSupplier|AttributeModifierMap|Builder)\s*'
+        r'[\w.]*\s*createMobAttributes\s*\(\s*\)\s*\{',
+        r'(?:public\s+static\s+)?(?:AttributeSupplier|AttributeModifierMap|Builder)\s*'
+        r'[\w.]*\s*createMonsterAttributes\s*\(\s*\)\s*\{',
+        r'(?:public\s+static\s+)?(?:AttributeSupplier|AttributeModifierMap|Builder)\s*'
+        r'[\w.]*\s*createAnimalAttributes\s*\(\s*\)\s*\{',
+        # Loose: any method returning Builder
+        r'static\s+\w*Builder\w*\s+\w+Attributes\w*\s*\(\s*\)\s*\{',
     ]
+    for pat in method_patterns:
+        m = re.search(pat, java_code, re.IGNORECASE | re.DOTALL)
+        if m:
+            start = m.end() - 1  # position of '{'
+            depth = 0
+            i = start
+            while i < len(java_code):
+                if java_code[i] == '{':
+                    depth += 1
+                elif java_code[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return java_code[start:i + 1]
+                i += 1
+    return java_code  # fallback: entire file
 
-    # Find the specific block for attributes to avoid picking up 
-    # numbers from procedures or animations elsewhere in the file.
-    block_match = re.search(r'public static Builder createAttributes\(\) \{(.*?)\}', java_code, re.DOTALL)
-    if not block_match:
-        return {"error": "Could not find createAttributes block"}
 
-    attribute_block = block_match.group(1)
+def extract_attributes_from_java(java_code: str) -> dict:
+    """
+    Extract entity attributes from Java source.
 
-    # Extract every number passed as the second argument in the .m_22268_ or .add calls
-    # Matches: , 0.3) or , 1024.0)
-    values = re.findall(r',\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)', attribute_block)
+    Multi-strategy, robust to hand-crafted mods:
+      1. Named attribute constants:  .add(Attributes.MAX_HEALTH, 40.0)
+      2. String-key registration:    .add("maxHealth", 40.0)
+      3. SRG obfuscated field names: .add(f_22284_, 100.0)   (decompiled only)
+      4. Positional fallback (last resort, legacy decompiled bytecode)
+    Returns dict of {bedrock_attribute_key: float_value}.
+    """
+    results: Dict[str, float] = {}
+    block = _extract_attr_block(java_code)
 
-    results = {}
-    for i, val_str in enumerate(values):
-        if i < len(ORDER_MAPPING):
-            # Clean Java suffixes (D, f, L) and convert to float
-            clean_val = float(re.sub(r'[DdFfLl]', '', val_str))
-            results[ORDER_MAPPING[i]] = clean_val
+    # ── Strategy 1: .add(SomeClass.ATTR_CONSTANT, value) ─────────────────────
+    # Handles:  .add(Attributes.MAX_HEALTH, 40.0)
+    #           .add(EntityAttributes.GENERIC_MOVEMENT_SPEED, 0.25)
+    #           .add(ForgeAttributes.SWIM_SPEED, 0.4)
+    for m in re.finditer(
+        r'\.add\s*\(\s*(?:[A-Za-z0-9_$]+\.)+([A-Z_][A-Z0-9_]*)\s*,\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)\s*\)',
+        block, re.DOTALL
+    ):
+        bedrock_key = _JAVA_ATTR_NAME_MAP.get(m.group(1))
+        val = _parse_java_float(m.group(2))
+        if bedrock_key and val is not None and bedrock_key not in results:
+            results[bedrock_key] = val
+
+    # ── Strategy 2: .add("attributeName", value) ─────────────────────────────
+    for m in re.finditer(
+        r'\.add\s*\(\s*["\']([A-Za-z_.]+)["\']\s*,\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)\s*\)',
+        block, re.DOTALL
+    ):
+        raw_name = m.group(1).split(".")[-1].split(":")[-1]  # strip namespace
+        # Try camelCase and UPPER_SNAKE normalisation
+        upper = re.sub(r'(?<=[a-z])(?=[A-Z])', '_', raw_name).upper()
+        bedrock_key = _JAVA_ATTR_NAME_MAP.get(raw_name) or _JAVA_ATTR_NAME_MAP.get(upper)
+        val = _parse_java_float(m.group(2))
+        if bedrock_key and val is not None and bedrock_key not in results:
+            results[bedrock_key] = val
+
+    # ── Strategy 3: SRG obfuscated field names ────────────────────────────────
+    if not results:
+        for m in re.finditer(
+            r'\.add\s*\(\s*(f_[0-9_]+_)\s*,\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)\s*\)',
+            block, re.DOTALL
+        ):
+            bedrock_key = _SRG_ATTR_FIELD_MAP.get(m.group(1))
+            val = _parse_java_float(m.group(2))
+            if bedrock_key and val is not None and bedrock_key not in results:
+                results[bedrock_key] = val
+
+    # ── Strategy 4: Legacy positional fallback ────────────────────────────────
+    # Only triggers if nothing at all was found — covers very old decompiled JARs.
+    if not results:
+        POSITIONAL_ORDER = [
+            "movement_speed", "follow_range", "health",
+            "knockback_resistance", "armor", "attack_damage"
+        ]
+        values = re.findall(r',\s*([-+]?[0-9]*\.?[0-9]+[DdFfLl]?)', block)
+        for i, val_str in enumerate(values):
+            if i < len(POSITIONAL_ORDER):
+                val = _parse_java_float(val_str)
+                if val is not None:
+                    results[POSITIONAL_ORDER[i]] = val
 
     return results
-
-# Example usage with your provided code:
-# attributes = extract_attributes_by_physical_order(your_java_string)
-# print(attributes)
 def extract_animations_from_java(java_code: str, namespace: Optional[str] = None, entity_name: Optional[str] = None):
     """
     Extract animation IDs referenced in Java entity/renderer code.
@@ -1557,18 +2951,32 @@ def extract_animations_from_java(java_code: str, namespace: Optional[str] = None
 
     # All recognised motion-category keywords (must appear in the LAST segment of the ID)
     MOTION_KEYWORDS = {
-        "idle", "stand", "pose", "float",
-        "walk", "walking",
-        "run", "running", "chase", "sprint",
-        "attack", "strike", "bite", "swipe", "slam", "lunge", "claw",
-        "hurt", "hit", "flinch", "pain",
-        "death", "die", "dying", "dead",
-        "sit", "sitting", "crouch", "lay",
-        "swim", "swimming",
-        "fly", "flying", "hover", "glide",
-        "sleep", "sleeping", "rest",
-        "spawn", "appear", "emerge", "summon",
-        "open", "close", "blink", "tail", "wing", "flap",
+        # Standing / resting
+        "idle", "stand", "standing", "pose", "float", "floating", "ambient",
+        "breathe", "blink", "twitch", "fidget",
+        # Locomotion
+        "walk", "walking", "wander", "wander",
+        "run", "running", "chase", "sprint", "sprinting", "dash", "gallop",
+        "swim", "swimming", "paddle", "crawl", "slither", "jump", "jumping", "leap",
+        "fly", "flying", "hover", "hovering", "glide", "gliding", "soar",
+        "climb", "climbing", "roll",
+        # Combat
+        "attack", "attacking", "strike", "striking", "bite", "biting",
+        "swipe", "swiping", "slam", "slamming", "lunge", "lunging",
+        "claw", "clawing", "charge", "charging", "thrust", "shoot", "shooting",
+        "breath", "roar",
+        # Reactions
+        "hurt", "hit", "flinch", "pain", "stagger", "reel",
+        "death", "die", "dying", "dead", "collapse", "fall",
+        # States
+        "sit", "sitting", "crouch", "crouching", "lay", "laying", "lie",
+        "sleep", "sleeping", "rest", "resting", "curl",
+        # Actions
+        "spawn", "appear", "emerge", "summon", "summon",
+        "open", "close", "dig", "eat", "drink",
+        # Parts (animation fragment names common in hand-crafted mods)
+        "tail", "wing", "wings", "ear", "head", "jaw", "mouth",
+        "flap", "wag", "sway", "spin", "shake",
     }
 
     def _looks_like_anim_id(s: str) -> bool:
@@ -1614,6 +3022,13 @@ def extract_animations_from_java(java_code: str, namespace: Optional[str] = None
             if s:
                 _add(s, trusted=True)
 
+        # GeckoLib 4: thenPlay("animation.entity.walk") / thenLoop("animation.entity.idle")
+        for method in ('thenPlay', 'thenLoop', 'thenPlayAndHold', 'playAnim', 'playAnimation', 'setAnimation'):
+            for inv in ast.invocations_of(method):
+                s = JavaAST.first_string_arg(inv)
+                if s:
+                    _add(s, trusted=True)
+
         # Scan string literals — only accepted if they pass the motion-keyword filter
         for lit in ast.all_string_literals():
             _add(lit, trusted=False)
@@ -1638,6 +3053,19 @@ def extract_animations_from_java(java_code: str, namespace: Optional[str] = None
             _add(m.group(1), trusted=False)
         for m in re.finditer(r'(?:ANIMATION|ANIM)[_A-Z0-9]*\s*=\s*["\']+([^"\']+)["\']+', java_code):
             _add(m.group(1), trusted=False)
+        # GeckoLib 4+ / GeckoLib 3 patterns
+        # RawAnimation.begin().thenPlay("animation.entity.walk")
+        for m in re.finditer(r'thenPlay\s*\(\s*["\'"]([^"\']+)["\'"]', java_code):
+            _add(m.group(1), trusted=True)
+        # RawAnimation.begin().thenLoop("animation.entity.idle")
+        for m in re.finditer(r'thenLoop\s*\(\s*["\'"]([^"\']+)["\'"]', java_code):
+            _add(m.group(1), trusted=True)
+        # AnimationState / state.getController().setAnimation(RawAnimation...)
+        for m in re.finditer(r'setAnimation\s*\(\s*RawAnimation\.begin\s*\(\s*\)\s*\.then(?:Play|Loop)\s*\(\s*["\'"]([^"\']+)["\'"]', java_code, re.DOTALL):
+            _add(m.group(1), trusted=True)
+        # .playAnim("animation.entity.attack")
+        for m in re.finditer(r'playAnim(?:ation)?\s*\(\s*["\'"]([^"\']+)["\'"]', java_code):
+            _add(m.group(1), trusted=True)
 
     return animations
 
@@ -2116,46 +3544,99 @@ def extract_ai_goals_from_java(java_code: str,
     return ai_goals
 
 def extract_damage_immunities_from_java(java_code: str):
+    """
+    Extract damage immunities from Java entity source.
+    Handles both hand-crafted mods (readable DamageTypes/DamageSource names)
+    and decompiled obfuscated bytecode (SRG field names).
+    """
     immunities = set()
-    class_checks = {
-        "AbstractArrow": "projectile",
-        "Player": "player",
-        "ThrownPotion": "potion",
-        "AreaEffectCloud": "area_effect_cloud",
+
+    # ── instanceof checks -> projectile ───────────────────────────────────────
+    projectile_types = {
+        "AbstractArrow", "Arrow", "SpectralArrow", "Trident",
+        "ShulkerBullet", "FireworkRocketEntity", "ThrownPotion",
+        "ThrownSplashPotion", "WindCharge", "SmallFireball", "LargeFireball",
     }
-    for cls, cause in class_checks.items():
-        if re.search(rf'instanceof\s+{cls}', java_code):
-            immunities.add(cause)
-    if re.search(r'm_19385_\(\)\.equals\(["\']trident["\']\)', java_code) or re.search(r'equals\(["\']trident["\']\)', java_code):
-        immunities.add("projectile")
-    if re.search(r'm_19385_\(\)\.equals\(["\']witherSkull["\']\)', java_code) or re.search(r'witherskull', java_code, re.I):
-        immunities.add("projectile")
-    if re.search(r'DamageSource\.f_19315_', java_code) or re.search(r'FIRE', java_code, re.I):
-        immunities.add("fire")
-    if re.search(r'DamageSource\.f_19314_', java_code) or re.search(r'Drown', java_code, re.I):
-        immunities.add("drown")
-    if re.search(r'DamageSource\.f_19312_', java_code) or re.search(r'Fall', java_code, re.I):
-        immunities.add("fall")
-    if re.search(r'witherskull', java_code, re.I) or re.search(r'WITHER', java_code, re.I):
-        immunities.add("magic")
-    if re.search(r'explosion', java_code, re.I):
+    for cls in projectile_types:
+        if re.search(rf'\binstanceof\s+{re.escape(cls)}\b', java_code):
+            immunities.add("projectile")
+            break
+
+    # ── Player instanceof check -> player ─────────────────────────────────────
+    if re.search(r'\binstanceof\s+(?:Player|ServerPlayer|EntityPlayer)\b', java_code):
+        immunities.add("player")
+
+    # ── Fire/heat ─────────────────────────────────────────────────────────────
+    fire_patterns = [
+        r'\bfireImmune\s*\(\)',             # builder method: .fireImmune()
+        r'fireImmune\s*=\s*true',
+        r'isFireImmune\s*\(\s*\)\s*\{[^}]*return\s+true',
+        r'DamageSource\.(?:ON_FIRE|IN_FIRE|LIGHTNING|HOT_FLOOR|LAVA|CAMPFIRE)',
+        r'DamageTypes\.(?:ON_FIRE|IN_FIRE|LAVA|HOT_FLOOR)',
+        r'"fire"\s*,',                      # DamageSource string key
+        # SRG fallback
+        r'DamageSource\.f_19315_',
+        r'isOnFire\s*\(\s*\)',
+    ]
+    for pat in fire_patterns:
+        if re.search(pat, java_code, re.IGNORECASE):
+            immunities.add("fire")
+            break
+
+    # ── Drowning ──────────────────────────────────────────────────────────────
+    drown_patterns = [
+        r'canBreatheUnderwater\s*\(\s*\)\s*\{[^}]*return\s+true',
+        r'DamageSource\.(?:DROWN|DROWN_ING)',
+        r'DamageTypes\.DROWN',
+        r'"drown"',
+        r'DamageSource\.f_19314_',
+    ]
+    for pat in drown_patterns:
+        if re.search(pat, java_code, re.IGNORECASE):
+            immunities.add("drown")
+            break
+
+    # ── Fall damage ───────────────────────────────────────────────────────────
+    fall_patterns = [
+        r'causeFallDamage\s*\([^)]*\)\s*\{[^}]*return\s+false',
+        r'DamageSource\.(?:FALL|STALAGMITE)',
+        r'DamageTypes\.FALL',
+        r'"fall"',
+        r'DamageSource\.f_19312_',
+    ]
+    for pat in fall_patterns:
+        if re.search(pat, java_code, re.IGNORECASE):
+            immunities.add("fall")
+            break
+
+    # ── Explosion ─────────────────────────────────────────────────────────────
+    if re.search(r'DamageSource\.(?:EXPLOSION|GENERIC_KILL|CRAMMING)|DamageTypes\.EXPLOSION|"explosion"', java_code, re.IGNORECASE):
         immunities.add("explosion")
-    if re.search(r'isMagic\(', java_code) or re.search(r'm_19372_\(\)', java_code):
-        immunities.add("magic")
-    found_classes = re.findall(r'instanceof\s+([A-Z][A-Za-z0-9_]*)', java_code)
-    fallback_map = {
-        "AbstractArrow": "projectile", "Arrow": "projectile",
-        "SpectralArrow": "projectile", "Trident": "projectile",
-        "ShulkerBullet": "projectile", "FireworkRocketEntity": "projectile",
-        "Player": "player", "ServerPlayer": "player",
-        "ThrownPotion": "potion", "ThrownSplashPotion": "potion",
-        "AreaEffectCloud": "area_effect_cloud", "Entity": None
-    }
-    for cls in found_classes:
-        if cls in fallback_map and fallback_map[cls]:
-            immunities.add(fallback_map[cls])
-    if re.search(r'isInvulnerableTo\s*\([^)]*\)\s*\{[^}]*return\s+true', java_code, re.DOTALL):
+
+    # ── Magic/poison ─────────────────────────────────────────────────────────
+    magic_patterns = [
+        r'DamageSource\.(?:MAGIC|WITHER|DRAGON_BREATH)',
+        r'DamageTypes\.(?:MAGIC|WITHER|DRAGON_BREATH)',
+        r'isMagic\s*\(\s*\)',
+        r'"magic"',
+        r'm_19372_\(\)',   # SRG
+    ]
+    for pat in magic_patterns:
+        if re.search(pat, java_code, re.IGNORECASE):
+            immunities.add("magic")
+            break
+
+    # ── Wither ────────────────────────────────────────────────────────────────
+    if re.search(r'(?:witherSkull|WitherBoss|WITHER_SKULL)', java_code, re.IGNORECASE):
+        immunities.add("wither")
+
+    # ── Full invulnerability ──────────────────────────────────────────────────
+    if re.search(
+        r'isInvulnerableTo\s*\([^)]*\)\s*\{[^}]*return\s+true',
+        java_code, re.DOTALL
+    ):
         immunities.add("all")
+
     return sorted(immunities)
 
 def detect_dynamic_bounding_procedure(java_code: str) -> Optional[str]:
@@ -2265,46 +3746,106 @@ def write_rp_entity_json(entity_basename: str, namespace: str, texture_ref: str,
 # Block & Item conversion (unchanged)
 # -------------------------
 def extract_block_properties_from_java(java_code: str):
+    """
+    Extract block properties from Java source.
+    Handles vanilla Forge, NeoForge, and hand-crafted mod API styles.
+    """
     props = {
         "destroy_time": None,
         "explosion_resistance": None,
         "material": None,
         "texture_hint": None,
-        "loot_table": None
+        "loot_table": None,
+        "light_emission": 0,
+        "friction": 0.6,
+        "is_solid": True,
+        "is_opaque": True,
     }
-    m = re.search(r'\.strength\(\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*([0-9]+(?:\.[0-9]+)?))?\s*\)', java_code)
+
+    # ── Hardness / strength ───────────────────────────────────────────────────
+    # Handles: .strength(1.5f, 6.0f), .strength(2.0), .strength(2)
+    _float_pat = r'[-+]?[0-9]*\.?[0-9]+[FfDd]?'
+    m = re.search(rf'\.strength\s*\(\s*({_float_pat})(?:\s*,\s*({_float_pat}))?\s*\)', java_code)
     if m:
-        try:
-            props["destroy_time"] = float(m.group(1))
-        except Exception:
-            pass
+        try: props["destroy_time"] = float(re.sub(r'[FfDd]$', '', m.group(1)))
+        except Exception: pass
         if m.group(2):
-            try:
-                props["explosion_resistance"] = float(m.group(2))
-            except Exception:
-                pass
-    m2 = re.search(r'(?:explosionResistance|explosion_resistance|explosionResistant)\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)', java_code)
-    if m2:
-        try:
-            props["explosion_resistance"] = float(m2.group(1))
-        except Exception:
-            pass
+            try: props["explosion_resistance"] = float(re.sub(r'[FfDd]$', '', m.group(2)))
+            except Exception: pass
+
+    # destroyTime() separate from resistance
+    m_dt = re.search(r'\.destroyTime\s*\(\s*([-+]?[0-9]*\.?[0-9]+[FfDd]?)\s*\)', java_code)
+    if m_dt and props["destroy_time"] is None:
+        try: props["destroy_time"] = float(re.sub(r'[FfDd]$', '', m_dt.group(1)))
+        except Exception: pass
+
+    # hardness (older API)
+    m_h = re.search(r'\.hardness\s*\(\s*([-+]?[0-9]*\.?[0-9]+[FfDd]?)\s*\)', java_code)
+    if m_h and props["destroy_time"] is None:
+        try: props["destroy_time"] = float(re.sub(r'[FfDd]$', '', m_h.group(1)))
+        except Exception: pass
+
+    # ── Explosion resistance ──────────────────────────────────────────────────
+    m2 = re.search(r'(?:explosionResistance|explosion_resistance|explosionResistant|resistance)\s*\(?\s*([0-9]+(?:\.[0-9]+)?)\s*\)?', java_code)
+    if m2 and props["explosion_resistance"] is None:
+        try: props["explosion_resistance"] = float(m2.group(1))
+        except Exception: pass
+
+    # ── Material ──────────────────────────────────────────────────────────────
     m3 = re.search(r'Material\.([A-Z_]+)', java_code)
     if m3:
         props["material"] = m3.group(1).lower()
-    m4 = re.search(r'setRegistryName\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+
+    # ── Light emission (multiple API forms) ───────────────────────────────────
+    # .lightLevel(state -> 15)  -- lambda form (NeoForge / modern Forge)
+    m_ll_lambda = re.search(r'\.lightLevel\s*\(\s*(?:state\s*->|[a-z]+\s*->)\s*([0-9]+)\s*\)', java_code)
+    if m_ll_lambda:
+        try: props["light_emission"] = min(15, int(m_ll_lambda.group(1)))
+        except Exception: pass
+
+    # .lightLevel(15)  -- direct
+    if not props["light_emission"]:
+        m_ll = re.search(r'\.lightLevel\s*\(\s*([0-9]+)\s*\)', java_code)
+        if m_ll:
+            try: props["light_emission"] = min(15, int(m_ll.group(1)))
+            except Exception: pass
+
+    # .lightEmission(15)  -- NeoForge style
+    if not props["light_emission"]:
+        m_le = re.search(r'\.lightEmission\s*\(\s*([0-9]+)\s*\)', java_code)
+        if m_le:
+            try: props["light_emission"] = min(15, int(m_le.group(1)))
+            except Exception: pass
+
+    # ── Friction / slipperiness ───────────────────────────────────────────────
+    m4 = re.search(r'(?:slipperiness|friction)\s*\(?\s*([0-9]+(?:\.[0-9]+)?)\s*\)?', java_code)
     if m4:
-        props["texture_hint"] = m4.group(1).split(":")[-1]
+        try: props["friction"] = float(m4.group(1))
+        except Exception: pass
+
+    # ── Texture hint from registry name ──────────────────────────────────────
+    m_rn = re.search(r'setRegistryName\s*\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+    if m_rn:
+        props["texture_hint"] = m_rn.group(1).split(":")[-1]
     else:
-        m5 = re.search(r'new\s+ResourceLocation\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
-        if m5:
-            props["texture_hint"] = m5.group(1).split(":")[-1]
-    m6 = re.search(r'getLootTable\(\)\s*.*?["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+        m_rl = re.search(r'new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+        if m_rl:
+            props["texture_hint"] = m_rl.group(1).split(":")[-1]
+
+    # ── Loot table ────────────────────────────────────────────────────────────
+    m6 = re.search(r'getLootTable\(\)\s*.*?["\']([a-z0-9_:-/]+)["\']', java_code, re.I | re.DOTALL)
     if m6:
         props["loot_table"] = m6.group(1)
-    m7 = re.search(r'lootTable\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+    m7 = re.search(r'lootTable\(\s*["\']([a-z0-9_:-/]+)["\']', java_code, re.I)
     if m7:
         props["loot_table"] = m7.group(1)
+
+    # ── Solidity / opacity ────────────────────────────────────────────────────
+    if re.search(r'\.noOcclusion\(\)|noCollission\(\)|noOcclusionBlock\(\)', java_code):
+        props["is_opaque"] = False
+    if re.search(r'\.noCollission\(\)|noCollision\(\)', java_code):
+        props["is_solid"] = False
+
     return props
 
 def convert_java_block_to_bedrock(java_path: str, namespace: str):
@@ -2343,43 +3884,109 @@ def convert_java_block_to_bedrock(java_path: str, namespace: str):
     print(f"Converted block {java_path} -> {out_path}")
 
 def extract_item_properties_from_java(java_code: str):
+    """
+    Extract item properties from Java source.
+    Handles vanilla Forge, NeoForge 1.20+, Fabric, and hand-crafted mod styles.
+    """
     props = {
         "max_stack_size": None,
         "durability": None,
         "texture_hint": None,
         "creative_tab": None,
-        "registry_name": None
+        "registry_name": None,
+        "is_food": False,
+        "nutrition": 0,
+        "saturation": 0.0,
+        "is_armor": False,
+        "armor_slot": None,
+        "is_weapon": False,
+        "attack_damage": 0,
+        "is_tool": False,
     }
-    m = re.search(r'\.stacksTo\(\s*([0-9]+)\s*\)', java_code)
-    if m:
-        try:
-            props["max_stack_size"] = int(m.group(1))
-        except Exception:
-            pass
-    m2 = re.search(r'(?:maxStackSize|setMaxStackSize)\s*[=:]?\s*([0-9]+)', java_code)
-    if m2 and props["max_stack_size"] is None:
-        try:
-            props["max_stack_size"] = int(m2.group(1))
-        except Exception:
-            pass
-    m3 = re.search(r'(?:defaultMaxDamage|maxDamage|setMaxDamage)\(\s*([0-9]+)\s*\)', java_code)
-    if m3:
-        try:
-            props["durability"] = int(m3.group(1))
-        except Exception:
-            pass
-    m4 = re.search(r'setRegistryName\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
-    if m4:
-        props["registry_name"] = m4.group(1)
-        props["texture_hint"] = m4.group(1).split(":")[-1]
-    else:
-        m5 = re.search(r'new\s+ResourceLocation\(\s*["\']([a-z0-9_:-]+)["\']', java_code, re.I)
+
+    # ── Max stack size ────────────────────────────────────────────────────────
+    for pat in [
+        r'\.stacksTo\s*\(\s*([0-9]+)\s*\)',
+        r'maxStackSize\s*\(\s*([0-9]+)\s*\)',
+        r'setMaxStackSize\s*\(\s*([0-9]+)\s*\)',
+        r'stack(?:Size|_size)\s*[=:]\s*([0-9]+)',
+    ]:
+        m = re.search(pat, java_code, re.I)
+        if m:
+            try: props["max_stack_size"] = int(m.group(1)); break
+            except Exception: pass
+
+    # ── Durability ────────────────────────────────────────────────────────────
+    for pat in [
+        r'\.defaultMaxDamage\s*\(\s*([0-9]+)\s*\)',
+        r'\.durability\s*\(\s*([0-9]+)\s*\)',
+        r'maxDamage\s*\(\s*([0-9]+)\s*\)',
+        r'setMaxDamage\s*\(\s*([0-9]+)\s*\)',
+        r'(?:DURABILITY|MAX_DAMAGE)\s*[=:]\s*([0-9]+)',
+    ]:
+        m = re.search(pat, java_code, re.I)
+        if m:
+            try: props["durability"] = int(m.group(1)); break
+            except Exception: pass
+
+    # ── Registry name / texture hint ──────────────────────────────────────────
+    for pat in [
+        r'setRegistryName\s*\(\s*["\']([a-z0-9_:-]+)["\']',
+        r'new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:-]+)["\']\s*\)',
+        r'ResourceLocation\s*\(\s*["\'][^"\']+["\']\s*,\s*["\']([a-z0-9_/:-]+)["\']',
+    ]:
+        m = re.search(pat, java_code, re.I)
+        if m:
+            raw = m.group(1)
+            props["registry_name"] = raw
+            props["texture_hint"] = raw.split(":")[-1]
+            break
+
+    # ── Creative tab ──────────────────────────────────────────────────────────
+    for pat in [
+        r'ItemGroup\.([A-Z0-9_]+)',
+        r'CreativeModeTab\.([A-Z0-9_]+)',
+        r'\.tab\s*\(\s*(?:[A-Za-z0-9_]+\.)+([A-Z0-9_]+)\s*\)',
+        r'creativeModeTab\s*\(\s*(?:[A-Za-z0-9_]+\.)+([A-Z0-9_]+)\s*\)',
+    ]:
+        m = re.search(pat, java_code)
+        if m:
+            props["creative_tab"] = m.group(1).lower()
+            break
+
+    # ── Food ─────────────────────────────────────────────────────────────────
+    if re.search(r'FoodProperties|\.food\s*\(|nutrition|saturationMod|extends\s+(?:ItemFood|BowlFoodItem)', java_code, re.I):
+        props["is_food"] = True
+        m3 = re.search(r'nutrition\s*\(?\s*(\d+)', java_code, re.I)
+        if m3: props["nutrition"] = int(m3.group(1))
+        m4 = re.search(r'saturation(?:Modifier|Mod)?\s*\(?\s*([0-9.]+)', java_code, re.I)
+        if m4: props["saturation"] = float(m4.group(1))
+
+    # ── Armor ─────────────────────────────────────────────────────────────────
+    slot_map = {
+        r'EquipmentSlot\.HEAD|ArmorItem.*HEAD': "slot.armor.head",
+        r'EquipmentSlot\.CHEST|ArmorItem.*CHEST': "slot.armor.chest",
+        r'EquipmentSlot\.LEGS|ArmorItem.*LEGS': "slot.armor.legs",
+        r'EquipmentSlot\.FEET|ArmorItem.*FEET': "slot.armor.feet",
+    }
+    for pat, slot in slot_map.items():
+        if re.search(pat, java_code, re.I):
+            props["is_armor"] = True
+            props["armor_slot"] = slot
+            break
+
+    # ── Weapon ────────────────────────────────────────────────────────────────
+    if re.search(r'SwordItem|TieredItem|extends.*Sword|ATTACK_DAMAGE_MODIFIER', java_code, re.I):
+        props["is_weapon"] = True
+        m5 = re.search(r'attackDamage\s*[=+]+\s*([0-9.]+)|ATTACK_DAMAGE\s*[=:]\s*([0-9.]+)', java_code, re.I)
         if m5:
-            props["registry_name"] = m5.group(1)
-            props["texture_hint"] = m5.group(1).split(":")[-1]
-    m6 = re.search(r'ItemGroup\.([A-Z0-9_]+)', java_code)
-    if m6:
-        props["creative_tab"] = m6.group(1).lower()
+            try: props["attack_damage"] = float(m5.group(1) or m5.group(2))
+            except Exception: pass
+
+    # ── Tool ──────────────────────────────────────────────────────────────────
+    if re.search(r'PickaxeItem|ShovelItem|AxeItem|HoeItem|DiggerItem|extends.*Tool', java_code, re.I):
+        props["is_tool"] = True
+
     return props
 
 def convert_java_item_to_bedrock(java_path: str, namespace: str):
@@ -2432,17 +4039,29 @@ NON_ENTITY_KEYWORDS = [
 ENTITY_OVERRIDE_KEYWORDS = ["entity", "mob", "monster", "creature", "animal", "boss", "npc"]
 
 _ENTITY_SUPERCLASSES = {
-    # Vanilla / shared
-    'Entity', 'Mob', 'Monster', 'Animal', 'PathfinderMob', 'TamableAnimal',
-    'TameableAnimal', 'CreatureEntity', 'LivingEntity', 'MobEntity',
-    'WaterAnimal', 'AmbientCreature', 'FlyingMob', 'AbstractGolem',
-    'AbstractVillager', 'AbstractPiglin', 'AbstractSkeleton',
+    # ── Core vanilla ──────────────────────────────────────────────────────────
+    'Entity', 'Mob', 'Monster', 'Animal', 'PathfinderMob',
+    'TamableAnimal', 'TameableAnimal',
+    'CreatureEntity', 'LivingEntity', 'MobEntity',
+    'WaterAnimal', 'AmbientCreature', 'FlyingMob',
+    'AbstractGolem', 'AbstractVillager', 'AbstractPiglin', 'AbstractSkeleton',
     'Projectile', 'AbstractArrow',
-    # NeoForge-specific base classes
-    'NeoForgeEntity', 'NeoForgeMob',
-    # Common shared mob patterns
-    'AbstractNeutralMob', 'AbstractHurtingProjectile', 'FireworkRocketEntity',
-    'ThrowableProjectile', 'ThrowableItemProjectile',
+    'AbstractNeutralMob', 'AbstractHurtingProjectile',
+    'FireworkRocketEntity', 'ThrowableProjectile', 'ThrowableItemProjectile',
+    # ── More vanilla base classes ─────────────────────────────────────────────
+    'AbstractFish', 'AbstractSchoolingFish', 'AbstractChestedHorse',
+    'AbstractHorse', 'AbstractIllager', 'AbstractRaider', 'AbstractZombie',
+    'SpellcasterIllager', 'PatrollingMonster', 'Slime', 'Ghast',
+    'Ageable', 'AgeableMob', 'AbstractCreature',
+    'ShoulderRidingEntity', 'OcelotBase',
+    # ── Forge / NeoForge specific ─────────────────────────────────────────────
+    'NeoForgeEntity', 'NeoForgeMob', 'ForgeEntity',
+    # ── Fabric / Quilt ────────────────────────────────────────────────────────
+    'HostileEntity', 'PassiveEntity', 'AnimalEntity', 'WaterCreatureEntity',
+    'FlyingEntity', 'BlazeEntity', 'SlimeEntity', 'GolemEntity',
+    # ── Common hand-crafted mod base class naming patterns ────────────────────
+    # Mods often create their own base layer: BaseMonster, CustomMob, AbstractBoss …
+    # These are matched by suffix in is_likely_entity instead.
 }
 _ENTITY_METHOD_NAMES = {
     'registerGoals', 'defineSynchedData', 'createAttributes',
@@ -2461,41 +4080,119 @@ def is_likely_entity(java_code: str, filename: str) -> bool:
             if k in fname:
                 return False
 
+    # Class name ending in Entity is a very strong signal
     cls = extract_class_name(java_code) or ""
     if cls.lower().endswith("entity"):
         return True
+
+    # ── Suffix-based superclass pattern matching ──────────────────────────────
+    # Hand-crafted mods often create base classes whose names contain these
+    # suffixes but aren't in _ENTITY_SUPERCLASSES by exact name.
+    _SUPERCLASS_SUFFIXES = (
+        "Entity", "Mob", "Monster", "Animal", "Creature",
+        "Npc", "Boss", "Guardian", "Dragon", "Golem",
+    )
 
     # Try AST-based detection first
     ast = JavaAST(java_code)
     ast._parse()
     if ast._tree is not None:
-        # Check superclass
         for child, parent in ast.all_class_extends():
-            if JavaAST.strip_generics(parent) in _ENTITY_SUPERCLASSES:
+            parent_clean = JavaAST.strip_generics(parent)
+            if parent_clean in _ENTITY_SUPERCLASSES:
                 return True
-        # Check for entity-specific method declarations
+            # Suffix match for custom base classes (e.g. AbstractBossEntity)
+            if any(parent_clean.endswith(sfx) for sfx in _SUPERCLASS_SUFFIXES):
+                # Require at least one other entity signal to reduce false positives
+                if ast.method_names() & _ENTITY_METHOD_NAMES:
+                    return True
         if ast.method_names() & _ENTITY_METHOD_NAMES:
             return True
-        # Check for EntityType.Builder usage in object creations
+        # EntityType.Builder usage in the file
         for ctype in ast.all_object_creation_types():
-            if 'Entity' in ctype or 'Mob' in ctype:
+            ctype_clean = JavaAST.strip_generics(ctype)
+            if ctype_clean in _ENTITY_SUPERCLASSES:
                 return True
-        return False
+            if ctype_clean.endswith("Entity") or ctype_clean.endswith("Mob"):
+                if ast.method_names() & _ENTITY_METHOD_NAMES:
+                    return True
+        # ── Deep inheritance walk using prescan source map ────────────────────
+        # _ENTITY_SOURCE_MAP is populated by build_goal_inheritance_map() during
+        # prescan, which runs before the main conversion loop. Walk the superclass
+        # chain up to 8 levels deep to catch patterns like:
+        #   MyBoss -> AbstractBoss -> AbstractFlying -> FlyingMob (known)
+        if _ENTITY_SOURCE_MAP:
+            parent_name: Optional[str] = None
+            if ast._tree is not None:
+                for _c, _p in ast.all_class_extends():
+                    parent_name = JavaAST.strip_generics(_p)
+                    break
+            else:
+                _m = re.search(r'extends\s+([A-Za-z0-9_]+)', java_code)
+                parent_name = _m.group(1) if _m else None
 
-    # Regex fallback
-    if re.search(r'extends\s+(?:[A-Za-z0-9_<>.,\s]*\b(?:Entity|Mob|Monster|Animal|PathfinderMob|TamableAnimal|TameableAnimal|CreatureEntity|LivingEntity|MobEntity|WaterAnimal|AmbientCreature|FlyingMob|AbstractGolem|AbstractVillager|AbstractPiglin|AbstractSkeleton|Projectile|AbstractArrow|AbstractNeutralMob|ThrowableProjectile|ThrowableItemProjectile)\b)', java_code):
+            _visited: Set[str] = set()
+            while parent_name and parent_name not in _visited and len(_visited) < 8:
+                _visited.add(parent_name)
+                if parent_name in _ENTITY_SUPERCLASSES:
+                    return True
+                if parent_name in _ENTITY_SOURCE_MAP:
+                    _pcode = _ENTITY_SOURCE_MAP[parent_name]
+                    _past = JavaAST(_pcode)
+                    _past._parse()
+                    if _past._tree is not None:
+                        if _past.method_names() & _ENTITY_METHOD_NAMES:
+                            return True
+                        _next_parent: Optional[str] = None
+                        for _c2, _p2 in _past.all_class_extends():
+                            _next_parent = JavaAST.strip_generics(_p2)
+                            break
+                        parent_name = _next_parent
+                    else:
+                        if any(re.search(p, _pcode) for p in [
+                            r'\bregisterGoals\s*\(', r'\bcreateAttributes\s*\(',
+                            r'\bcreateNavigation\s*\(', r'\bdefineSynchedData\s*\('
+                        ]):
+                            return True
+                        _m2 = re.search(r'extends\s+([A-Za-z0-9_]+)', _pcode)
+                        parent_name = _m2.group(1) if _m2 else None
+                else:
+                    break
+
+        return False
+    # Build a broad superclass pattern that covers exact set + suffix heuristic.
+    exact_names = "|".join(re.escape(n) for n in sorted(_ENTITY_SUPERCLASSES, key=len, reverse=True))
+    if re.search(rf'extends\s+(?:[A-Za-z0-9_<>.,\s]*\b(?:{exact_names})\b)', java_code):
         return True
+    # Suffix-based: extends XxxEntity, XxxMob, etc.
+    if re.search(
+        r'extends\s+[A-Za-z0-9_]+(?:Entity|Mob|Monster|Animal|Creature|Boss|Golem|Npc|Guardian)\b',
+        java_code
+    ):
+        pass  # only accept if accompanied by entity methods (checked below)
+
     entity_methods = [
-        r'\bregisterGoals\s*\(', r'\bdefineSynchedData\s*\(',
-        r'\bcreateAttributes\s*\(', r'\bgetAddEntityPacket\s*\(',
-        r'\bgetDefaultAttributes\s*\(', r'\bcreateMobAttributes\s*\(',
-        r'\bcreateNavigation\s*\(', r'\bcreateBodyControl\s*\(',
-        r'EntityType\.Builder\.of', r'\bcreateMonsterAttributes\s*\(',
-        r'\bcreateAnimalAttributes\s*\(', r'\bcreatelivingAttributes\s*\(',
-        # NeoForge-specific patterns
+        r'\bregisterGoals\s*\(',
+        r'\bdefineSynchedData\s*\(',
+        r'\bcreateAttributes\s*\(',
+        r'\bgetAddEntityPacket\s*\(',
+        r'\bgetDefaultAttributes\s*\(',
+        r'\bcreateMobAttributes\s*\(',
+        r'\bcreateMonsterAttributes\s*\(',
+        r'\bcreateAnimalAttributes\s*\(',
+        r'\bcreateNavigation\s*\(',
+        r'\bcreateBodyControl\s*\(',
+        r'EntityType\.Builder\.of\b',
         r'\binitializeClient\s*\(',
         r'net\.neoforged\.[a-z.]+Entity',
-        r'@EventBusSubscriber\b.*?Bus\.MOD',
+        r'@EventBusSubscriber\b',
+        # GeckoLib entity renderer base
+        r'extends\s+GeoEntity\b',
+        r'GeoEntityRenderer\b',
+        # Fabric / Quilt
+        r'extends\s+HostileEntity\b',
+        r'extends\s+PassiveEntity\b',
+        r'extends\s+AnimalEntity\b',
     ]
     for pat in entity_methods:
         if re.search(pat, java_code):
@@ -2503,28 +4200,103 @@ def is_likely_entity(java_code: str, filename: str) -> bool:
     return False
 
 def extract_entity_texture_hint(java_code: str, entity_basename: Optional[str] = None) -> Optional[str]:
+    """
+    Extract the primary texture path for an entity from Java source.
+
+    Tries (in order of confidence):
+      1. GeckoLib getModelResource() / getTextureResource() / getAnimationResource()
+      2. Static TEXTURE / LAYER field containing a ResourceLocation string
+      3. setTexture("...") call
+      4. new ResourceLocation("ns", "path") two-arg form
+      5. new ResourceLocation("ns:path") single-arg form
+      6. Renderer super() or model TEXTURE field containing a path string
+      7. TEXTURE constant patterns (textures/entity/..., textures/mob/...)
+      8. Fuzzy: any string literal that looks like a texture path
+    Falls back to None if nothing believable is found.
+    """
+
+    def _first_likely(candidates):
+        for c in candidates:
+            if c and is_probable_texture(c, entity_basename):
+                return c
+        return None
+
+    # ── 1. GeckoLib resource methods ─────────────────────────────────────────
+    # getTextureResource(T animatable) { return new ResourceLocation("ns", "textures/entity/foo.png") }
+    for pat in [
+        r'getTextureResource\s*\([^)]*\)[^{]*\{[^}]*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+        r'getTextureLocation\s*\([^)]*\)[^{]*\{[^}]*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+    ]:
+        m = re.search(pat, java_code, re.DOTALL)
+        if m:
+            candidate = f"{m.group(1)}:{m.group(2)}"
+            if is_probable_texture(candidate, entity_basename):
+                return candidate
+
+    # Single-arg getTextureResource returning a ResourceLocation
+    for pat in [
+        r'getTextureResource\s*\([^)]*\)[^{]*\{[^}]*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        r'getTextureLocation\s*\([^)]*\)[^{]*\{[^}]*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*\)',
+    ]:
+        m = re.search(pat, java_code, re.DOTALL)
+        if m:
+            candidate = m.group(1)
+            if is_probable_texture(candidate, entity_basename):
+                return candidate
+
+    # ── 2. Static TEXTURE / LAYER_0 / TEXTURE_LOCATION fields ────────────────
+    texture_field_patterns = [
+        # private static final ResourceLocation TEXTURE = new ResourceLocation("ns", "textures/entity/foo.png")
+        r'(?:TEXTURE|TEXTURE_LOCATION|LAYER_0|TEXTURE_LOC|MODEL_LOCATION|SKIN)\s*=\s*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+        r'(?:TEXTURE|TEXTURE_LOCATION|LAYER_0|TEXTURE_LOC)\s*=\s*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        # GeckoLib: private static final String TEXTURE = "textures/entity/foo.png"
+        r'(?:TEXTURE|TEXTURE_PATH|TEXTURE_NAME)\s*=\s*["\']([^"\']{4,})["\']',
+    ]
+    for pat in texture_field_patterns:
+        m = re.search(pat, java_code, re.IGNORECASE)
+        if m:
+            candidate = f"{m.group(1)}:{m.group(2)}" if m.lastindex and m.lastindex >= 2 else m.group(1)
+            if is_probable_texture(candidate, entity_basename):
+                return candidate
+
+    # ── 3. setTexture("...") ──────────────────────────────────────────────────
+    m = re.search(r'setTexture\s*\(\s*["\']([^"\']+)["\']', java_code)
+    if m:
+        candidate = m.group(1)
+        if is_probable_texture(candidate, entity_basename):
+            return candidate
+
+    # ── 4. Two-arg ResourceLocation ───────────────────────────────────────────
+    for m in re.finditer(
+        r'new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:-]+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+        java_code, re.IGNORECASE
+    ):
+        candidate = f"{m.group(1)}:{m.group(2)}"
+        if is_probable_texture(candidate, entity_basename):
+            return candidate
+
+    # ── 5. Single-arg ResourceLocation ───────────────────────────────────────
+    for m in re.finditer(
+        r'new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:/-][^"\']*)["\']',
+        java_code, re.IGNORECASE
+    ):
+        candidate = m.group(1)
+        if is_probable_texture(candidate, entity_basename):
+            return candidate
+
+    # ── 6. TEXTURE[^\n]*?["'] pattern (constant with string value) ────────────
     m = re.search(r'TEXTURE[^\n\r]*?["\']([A-Za-z0-9_:/\-\.]+)["\']', java_code)
     if m:
         candidate = m.group(1)
         if is_probable_texture(candidate, entity_basename):
             return candidate
-    m2 = re.search(r'setTexture\(\s*["\']([A-Za-z0-9_:/\-\.]+)["\']', java_code)
-    if m2:
-        candidate = m2.group(1)
+
+    # ── 7. Loose: any string literal that contains textures/ or .png ─────────
+    for m in re.finditer(r'["\']([^"\']*(?:textures/|\.png)[^"\']*)["\']', java_code, re.IGNORECASE):
+        candidate = m.group(1)
         if is_probable_texture(candidate, entity_basename):
             return candidate
-    m3 = re.search(r'new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:-]+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)', java_code, re.IGNORECASE)
-    if m3:
-        ns = m3.group(1)
-        path = m3.group(2)
-        candidate = f"{ns}:{path}"
-        if is_probable_texture(candidate, entity_basename):
-            return candidate
-    m4 = re.search(r'new\s+ResourceLocation\(\s*["\']([a-z0-9_:-]+)["\']\s*\)', java_code, re.IGNORECASE)
-    if m4:
-        candidate = m4.group(1)
-        if is_probable_texture(candidate, entity_basename):
-            return candidate
+
     return None
 
 def is_probable_texture(candidate: Optional[str], entity_basename: Optional[str] = None) -> bool:
@@ -2548,6 +4320,266 @@ def is_probable_texture(candidate: Optional[str], entity_basename: Optional[str]
     if entity_basename and entity_basename.lower() in candidate.lower():
         return True
     return False
+
+
+def _find_related_code(cls_name: str) -> Optional[str]:
+    """
+    Search _ALL_JAVA_FILES for a class whose filename or declared class name
+    matches cls_name (case-insensitive). Returns source code or None.
+    """
+    target = cls_name.lower()
+    for path, code in _ALL_JAVA_FILES.items():
+        fname_stem = os.path.splitext(os.path.basename(path))[0].lower()
+        if fname_stem == target:
+            return code
+        declared = extract_class_name(code)
+        if declared and declared.lower() == target:
+            return code
+    return None
+
+
+def _referenced_class_names(code: str) -> List[str]:
+    """
+    Extract class names that are likely renderers or models referenced by an entity.
+    Covers the most common Java mod patterns.
+    """
+    found: List[str] = []
+    # EntityRenderers.register(TYPE, MyRenderer::new)
+    for m in re.finditer(
+        r'EntityRenderers\.register\s*\([^,)]+,\s*([A-Z][A-Za-z0-9_]+)\s*::',
+        code
+    ):
+        found.append(m.group(1))
+    # ClientRegistry.bindEntityRenderer / RenderingRegistry.registerEntityRenderingHandler
+    for m in re.finditer(
+        r'(?:bindEntityRenderer|registerEntityRenderingHandler)\s*\([^,)]+,\s*([A-Z][A-Za-z0-9_]+)',
+        code
+    ):
+        found.append(m.group(1))
+    # setModel(new MyModel(...)) or this.model = new MyModel(...)
+    for m in re.finditer(r'(?:setModel|this\.model)\s*\(?.*?new\s+([A-Z][A-Za-z0-9_]+)', code, re.DOTALL):
+        found.append(m.group(1))
+    # extends MobRenderer<Entity, MyModel<Entity>>
+    for m in re.finditer(
+        r'extends\s+\w+Renderer\s*<[^,>]+,\s*([A-Z][A-Za-z0-9_]+)',
+        code
+    ):
+        found.append(m.group(1))
+    # import statements for renderer/model classes
+    for m in re.finditer(
+        r'import\s+[\w.]+\.((?:[A-Z][A-Za-z0-9_]*)?(?:Renderer|Model|Layer))\s*;',
+        code
+    ):
+        found.append(m.group(1))
+    # GeckoLib: extends GeoEntityRenderer<MyEntity>  (model referenced via getGeoModel())
+    for m in re.finditer(
+        r'extends\s+Geo\w+Renderer\s*<([A-Z][A-Za-z0-9_]+)>',
+        code
+    ):
+        found.append(m.group(1) + "Model")   # convention: MyEntityModel
+    return list(dict.fromkeys(found))   # deduplicate, preserve order
+
+
+def _resolve_tex_hint_to_ref(hint: Optional[str], namespace: str, entity_basename: str) -> Optional[str]:
+    """
+    Turn a raw texture hint string into a namespaced RP reference,
+    verifying the file actually exists on disk. Returns None if unresolvable.
+    """
+    if not hint:
+        return None
+    ns = sanitize_identifier(namespace) or "converted"
+    candidate = hint.split(":")[-1].replace(".png", "").strip("/")
+    # strip leading 'textures/' (RP entity JSON never wants that prefix)
+    if candidate.startswith("textures/"):
+        candidate = candidate[len("textures/"):]
+    for probe in [
+        candidate,
+        f"entity/{candidate}",
+        f"entity/{os.path.basename(candidate)}",
+        f"entity/{entity_basename}",
+    ]:
+        probe = probe.replace("\\", "/")
+        if rp_texture_exists(probe):
+            return f"{ns}:{probe}"
+    return None
+
+
+def find_entity_assets_aggressively(
+    java_code: str,
+    entity_basename: str,
+    namespace: str,
+    entity_cls: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Aggressively hunt for the texture reference and geometry identifier for an entity.
+
+    Resolution order (both texture and geometry share the same chain):
+
+      1. Entity source file  — extract_entity_texture_hint / find_model_geometry_in_code
+      2. _RENDERER_MAP lookup — pre-scanned renderer + model class that handles this entity
+      3. Direct class-name search — scan _ALL_JAVA_FILES for files that:
+           • declare class MyEntityRenderer / MyEntityModel
+           • reference the entity class in their generic type or imports
+      4. Disk fuzzy match — score every indexed RP texture / geometry identifier
+         against the entity-name token set
+
+    Returns
+    -------
+    (texture_ref, geom_identifier)
+      texture_ref    : namespaced string like "mymod:entity/dragon", or None
+      geom_identifier: full geometry ID like "geometry.mymod.dragon", or None
+    """
+    ns       = sanitize_identifier(namespace) or "converted"
+    ent_toks = _camel_tokens(entity_basename)
+    # Also add the entity class name's tokens if different
+    if entity_cls:
+        ent_toks = ent_toks | _camel_tokens(entity_cls)
+    ent_toks -= _ASSET_NOISE  # remove noise; if that empties it, restore original
+    if not ent_toks:
+        ent_toks = _camel_tokens(entity_basename)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _tex_ref_from_hint(hint: Optional[str]) -> Optional[str]:
+        """Convert raw hint → verified RP ref, or None."""
+        if not hint:
+            return None
+        candidate = hint.split(":")[-1].replace(".png", "").strip("/")
+        if candidate.startswith("textures/"):
+            candidate = candidate[len("textures/"):]
+        for probe in [candidate, f"entity/{candidate}", f"entity/{os.path.basename(candidate)}"]:
+            if rp_texture_exists(probe):
+                return f"{ns}:{probe}"
+        # accept unverified if it looks like a real path
+        if "/" in candidate or "." in candidate:
+            return f"{ns}:{candidate}"
+        return None
+
+    def _geom_from_code(code: str) -> Optional[str]:
+        result = find_model_geometry_in_code(code)
+        if not result:
+            return None
+        ns_hint, geom_name = result
+        return f"geometry.{sanitize_identifier(ns_hint or namespace)}.{sanitize_identifier(geom_name)}"
+
+    def _best_texture_on_disk() -> Optional[str]:
+        best_score, best_ref = 0.0, None
+        for rel_no_ext, _ in _RP_ASSET_INDEX.get("textures", []):
+            score = _asset_score(ent_toks, rel_no_ext)
+            if rel_no_ext.startswith("entity/"):
+                score += 0.15
+            if score > best_score and score >= 0.30:
+                best_score = score
+                best_ref   = f"{ns}:{rel_no_ext}"
+        return best_ref
+
+    def _best_geometry_on_disk() -> Optional[str]:
+        best_score, best_ident = 0.0, None
+        for ident, _ in _RP_ASSET_INDEX.get("geometry", []):
+            ident_lower = ident.lower()
+            
+            # Skip non-entity geometries
+            # Blocks: glass, stone, wood, brick, ore, concrete, etc.
+            # Items: tool, weapon, item, armor, bow, sword, pickaxe, axe
+            # Spawner/egg: spawn_egg
+            skip_keywords = [
+                "spawn_egg",
+                "glass", "stone", "wood", "brick", "ore", "concrete", "sand", "dirt", "grass",
+                "item", "tool", "weapon", "armor", "bow", "sword", "pickaxe", "axe", "shovel", "hoe",
+                "cube", "box", "plane", "simple", "basic", "block",
+                "slab", "stair", "fence", "door", "gate", "lamp", "lamp", "button"
+            ]
+            if any(kw in ident_lower for kw in skip_keywords):
+                continue
+                
+            tail  = ident.replace("geometry.", "")
+            score = _asset_score(ent_toks, tail)
+            
+            # Require a higher minimum score to avoid spurious partial matches
+            # Also penalize matches that are only substring-based (score 0.32-0.38)
+            if score > best_score and score >= 0.40:  # Increased from 0.30 to 0.40
+                best_score = score
+                best_ident = ident
+                
+        return best_ident
+
+    def _try_codes(codes_and_labels):
+        """Run extraction on a list of (label, code) pairs, return first hit for (tex, geom)."""
+        tex, geom = None, None
+        for label, code in codes_and_labels:
+            if not tex:
+                raw = extract_entity_texture_hint(code, entity_basename)
+                tex = _tex_ref_from_hint(raw)
+                if tex:
+                    print(f"[assets] Texture found in {label}: {tex}")
+            if not geom:
+                geom = _geom_from_code(code)
+                if geom:
+                    print(f"[assets] Geometry found in {label}: {geom}")
+            if tex and geom:
+                break
+        return tex, geom
+
+    # ═══ STEP 1 — Entity file itself ═════════════════════════════════════════
+    tex_ref, geom_ident = _try_codes([("entity file", java_code)])
+
+    # ═══ STEP 2 — _RENDERER_MAP lookup ═══════════════════════════════════════
+    # Try the entity class name, the basename, and snake_case variants
+    if not (tex_ref and geom_ident):
+        candidates_cls = list(dict.fromkeys(filter(None, [
+            entity_cls,
+            entity_basename,
+            "".join(w.capitalize() for w in entity_basename.split("_")),  # snake→CamelCase
+        ])))
+        for lookup_key in candidates_cls:
+            entry = _RENDERER_MAP.get(lookup_key) or _RENDERER_MAP.get(lookup_key + "Entity")
+            if not entry:
+                continue
+            extra: List[Tuple[str, str]] = []
+            if entry.get("renderer_code"):
+                extra.append((f"renderer:{entry['renderer']}", entry["renderer_code"]))
+            if entry.get("model_code"):
+                extra.append((f"model:{entry['model']}", entry["model_code"]))
+            if extra:
+                t2, g2 = _try_codes(extra)
+                tex_ref   = tex_ref   or t2
+                geom_ident = geom_ident or g2
+            if tex_ref and geom_ident:
+                break
+
+    # ═══ STEP 3 — Direct class-name search in all files ══════════════════════
+    # Find any file whose class name contains the entity name (as renderer or model)
+    if not (tex_ref and geom_ident):
+        ent_lower = entity_basename.lower().replace("entity", "").strip("_")
+        related_codes: List[Tuple[str, str]] = []
+        for path, code in _ALL_JAVA_FILES.items():
+            fname_stem = os.path.splitext(os.path.basename(path))[0].lower()
+            # Files whose name contains the entity stem (e.g. "DragonRenderer", "DragonModel")
+            if ent_lower and ent_lower in fname_stem and fname_stem != entity_basename.lower():
+                related_codes.append((fname_stem, code))
+            # Files that mention the entity class name in their source
+            elif entity_cls and entity_cls in code and path not in java_code:
+                cls_there = extract_class_name(code)
+                if cls_there and any(kw in cls_there for kw in ("Renderer", "Model", "Layer")):
+                    related_codes.append((cls_there, code))
+        if related_codes:
+            t3, g3 = _try_codes(related_codes[:8])  # cap to avoid slow scans
+            tex_ref    = tex_ref    or t3
+            geom_ident = geom_ident or g3
+
+    # ═══ STEP 4 — Disk fuzzy match ════════════════════════════════════════════
+    if not tex_ref:
+        tex_ref = _best_texture_on_disk()
+        if tex_ref:
+            print(f"[assets] Texture fuzzy-matched for '{entity_basename}': {tex_ref}")
+
+    if not geom_ident:
+        geom_ident = _best_geometry_on_disk()
+        if geom_ident:
+            print(f"[assets] Geometry fuzzy-matched for '{entity_basename}': {geom_ident}")
+
+    return tex_ref, geom_ident
+
 
 def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: dict, geom_file_map: dict, geom_ns_map: dict, anim_key_map: dict, stats: dict):
     try:
@@ -2996,17 +5028,47 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
     print(f"Converted (BP entity) {java_path} -> {entity_json_path}")
     stats["converted_entities_bp"].append(entity_json_path)
 
-    # --- RP client entity generation only if geometry resolvable ---
-    texture_hint = extract_entity_texture_hint(java_code, entity_basename)
-    texture_ref = resolve_texture_reference(namespace, texture_hint, "entity", fallback_name=entity_basename)
+    # --- RP asset resolution: texture + geometry ---
+    # Step 0: Extract explicit geometry references from Java code (highest priority)
+    java_geom_tuple = find_model_geometry_in_code(java_code)
+    java_geom_identifier: Optional[str] = None
+    if java_geom_tuple:
+        java_ns, java_name = java_geom_tuple
+        java_ns_clean = sanitize_identifier(java_ns) if java_ns else None
+        java_name_clean = sanitize_identifier(java_name) if java_name else None
+        # Try to resolve the Java-specified geometry to an actual file
+        java_key = (java_ns_clean, java_name_clean)
+        java_key2 = (namespace.lower(), java_name_clean)
+        if java_key in geom_ns_map:
+            java_geom_identifier = geom_ns_map[java_key]
+            print(f"[java-ref] Found Java-referenced geometry for {entity_basename}: {java_geom_identifier}")
+        elif java_key2 in geom_ns_map:
+            java_geom_identifier = geom_ns_map[java_key2]
+            print(f"[java-ref] Found Java-referenced geometry for {entity_basename}: {java_geom_identifier}")
+        elif java_name_clean in geom_file_map:
+            java_geom_identifier = geom_file_map[java_name_clean]
+            print(f"[java-ref] Found Java-referenced geometry for {entity_basename}: {java_geom_identifier}")
+    
+    # Step 1: run the aggressive multi-strategy finder (cross-file + disk fuzzy)
+    entity_cls_name = extract_class_name(java_code)
+    aggressive_tex, aggressive_geom = find_entity_assets_aggressively(
+        java_code, entity_basename, namespace, entity_cls=entity_cls_name
+    )
 
-    # geckolib mapping attempts
+    # Step 2: Use Java-explicit geometry if found and valid (highest priority - Java code is authoritative)
+    geom_identifier: Optional[str] = None
+    if java_geom_identifier:
+        geom_identifier = java_geom_identifier
+
+    # Step 3: GeckoLib authoritative maps (if Java code didn't specify)
     entity_class_simple = os.path.splitext(os.path.basename(java_path))[0]
     geom_tuple = None
     geom_tuple = gecko_maps.get("entity_to_geometry", {}).get(entity_class_simple)
     if not geom_tuple:
         for k, v in gecko_maps.get("entity_to_geometry", {}).items():
-            if k.lower() == entity_class_simple.lower() or k.lower().endswith(entity_class_simple.lower()) or entity_class_simple.lower().endswith(k.lower()):
+            if (k.lower() == entity_class_simple.lower()
+                    or k.lower().endswith(entity_class_simple.lower())
+                    or entity_class_simple.lower().endswith(k.lower())):
                 geom_tuple = v
                 break
     if not geom_tuple:
@@ -3018,38 +5080,122 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
             if entity_basename.lower() in model_cls.lower() or entity_basename.lower() in geom[1].lower():
                 geom_tuple = geom
                 break
-    if not geom_tuple:
-        geom_tuple = find_model_geometry_in_code(java_code)
 
-    geom_identifier = None
+    # Check geom_tuple and skip invalid geometries
     if geom_tuple:
         ns_hint, geom_name = geom_tuple
-        ns_hint_clean = sanitize_identifier(ns_hint) if ns_hint else None
-        geom_name_clean = sanitize_identifier(geom_name) if geom_name else None
-        key = (ns_hint_clean, geom_name_clean)
-        if key in geom_ns_map:
-            geom_identifier = geom_ns_map[key]
-        else:
+        # Skip block/item/egg geometries — they're not entity models
+        if geom_name:
+            geom_name_lower = geom_name.lower()
+            skip_keywords = [
+                "spawn_egg",
+                "glass", "stone", "wood", "brick", "ore", "concrete", "sand", "dirt", "grass",
+                "item", "tool", "weapon", "armor", "bow", "sword", "pickaxe", "axe", "shovel", "hoe",
+                "cube", "box", "plane", "simple", "basic", "block",
+                "slab", "stair", "fence", "door", "gate", "lamp", "button"
+            ]
+            if any(kw in geom_name_lower for kw in skip_keywords):
+                geom_tuple = None
+        
+        if geom_tuple:
+            ns_hint, geom_name = geom_tuple
+            ns_hint_clean  = sanitize_identifier(ns_hint)  if ns_hint  else None
+            geom_name_clean = sanitize_identifier(geom_name) if geom_name else None
+            key  = (ns_hint_clean, geom_name_clean)
             key2 = (namespace.lower(), geom_name_clean)
-            if key2 in geom_ns_map:
+            if key in geom_ns_map:
+                geom_identifier = geom_ns_map[key]
+            elif key2 in geom_ns_map:
                 geom_identifier = geom_ns_map[key2]
+            elif geom_name_clean in geom_file_map:
+                geom_identifier = geom_file_map[geom_name_clean]
             else:
-                if geom_name_clean in geom_file_map:
-                    geom_identifier = geom_file_map[geom_name_clean]
-                else:
-                    for (ns_k, name_k), ident in geom_ns_map.items():
-                        if name_k and geom_name_clean and name_k.endswith(geom_name_clean):
-                            geom_identifier = ident
-                            break
+                for (ns_k, name_k), ident in geom_ns_map.items():
+                    if name_k and geom_name_clean and name_k.endswith(geom_name_clean):
+                        geom_identifier = ident
+                        break
+
+    if not geom_identifier and entity_basename.lower() in geom_file_map:
+        geom_identifier = geom_file_map[entity_basename.lower()]
+
+    # Step 4: Merge — gecko_maps wins if found, else use aggressive result
+    # Skip block/item geometries — they are not entity models
+    if not geom_identifier:
+        if aggressive_geom:
+            aggressive_lower = aggressive_geom.lower()
+            skip_keywords = [
+                "spawn_egg",
+                "glass", "stone", "wood", "brick", "ore", "concrete", "sand", "dirt", "grass",
+                "item", "tool", "weapon", "armor", "bow", "sword", "pickaxe", "axe", "shovel", "hoe",
+                "cube", "box", "plane", "simple", "basic", "block",
+                "slab", "stair", "fence", "door", "gate", "lamp", "button"
+            ]
+            is_invalid = any(kw in aggressive_lower for kw in skip_keywords)
+            if not is_invalid:
+                geom_identifier = aggressive_geom
+            elif is_invalid:
+                # Invalid geometry found but skip it, will fall back to other methods below
+                skip_reason = "spawn_egg" if "spawn_egg" in aggressive_lower else "item/simple geometry"
+                print(f"[assets] Skipping {skip_reason} for '{entity_basename}', continuing search...")
+                pass
+
+    # Step 5: Texture — prefer aggressive result (already verified on disk); fall back to resolve helper
+    if aggressive_tex:
+        texture_ref = aggressive_tex
+    else:
+        texture_hint = extract_entity_texture_hint(java_code, entity_basename)
+        texture_ref  = resolve_texture_reference(namespace, texture_hint, "entity", fallback_name=entity_basename)
+
+    # Step 6: Geometry placeholder if nothing at all was found
+    if not geom_identifier:
+        # Last-resort: check if we converted a LayerDefinition model whose name
+        # is similar to this entity (e.g. DragonModel for DragonEntity)
+        entity_cls = extract_class_name(java_code) or entity_basename
+        if _LAYERDEF_GEO_MAP:
+            # Direct match first
+            if entity_cls in _LAYERDEF_GEO_MAP:
+                geom_identifier = _LAYERDEF_GEO_MAP[entity_cls]
+            else:
+                # Stem match: DragonEntity <-> DragonModel
+                ent_stem = re.sub(r'(?i)Entity$', '', entity_cls).lower()
+                for model_cls, geo_id in _LAYERDEF_GEO_MAP.items():
+                    model_stem = re.sub(r'(?i)Model$', '', model_cls).lower()
+                    if ent_stem and model_stem and ent_stem == model_stem:
+                        geom_identifier = geo_id
+                        print(f"[layerdef-link] {entity_cls} -> {model_cls} -> {geo_id}")
+                        break
+                if not geom_identifier:
+                    # Try inline: this entity file itself has LayerDefinition
+                    geo_data = convert_layerdefinition_to_geckolib(
+                        java_code, entity_basename, namespace, entity_name=entity_name
+                    )
+                    if geo_data:
+                        out_path = os.path.join(RP_FOLDER, "geometry", f"{entity_basename}.geo.json")
+                        try:
+                            safe_write_json(out_path, geo_data)
+                            geom_identifier = geo_data['minecraft:geometry'][0]['description']['identifier']
+                            print(f"[layerdef-inline] Converted inline LayerDefinition for {entity_basename}")
+                        except Exception as _le:
+                            print(f"[layerdef-inline] Write failed: {_le}")
+        if not geom_identifier:
+            # Try inline even without _LAYERDEF_GEO_MAP
+            geo_data = convert_layerdefinition_to_geckolib(
+                java_code, entity_basename, namespace, entity_name=entity_name
+            )
+            if geo_data:
+                out_path = os.path.join(RP_FOLDER, "geometry", f"{entity_basename}.geo.json")
+                try:
+                    safe_write_json(out_path, geo_data)
+                    geom_identifier = geo_data['minecraft:geometry'][0]['description']['identifier']
+                    print(f"[layerdef-inline] Converted inline LayerDefinition for {entity_basename}")
+                except Exception as _le:
+                    print(f"[layerdef-inline] Write failed: {_le}")
 
     if not geom_identifier:
-        if entity_basename.lower() in geom_file_map:
-            geom_identifier = geom_file_map[entity_basename.lower()]
-
-    if not geom_identifier:
+        geom_identifier = f"geometry.{namespace}.{entity_name}"
         stats["missing_geometry"].append((java_path, entity_basename))
-        print(f"[skip-rp] No geometry found for entity {entity_basename} (java:{java_path}). BP entity written but RP client entity skipped to avoid broken links.")
-        return
+        print(f"[rp-fallback] No geometry found for {entity_basename} — using placeholder '{geom_identifier}'. "
+              f"Provide a matching .geo.json to fix rendering.")
 
     # finalize animation key selection
     chosen_animation_key = None
@@ -4002,6 +6148,7 @@ def generate_trading_table(entity_id: str, java_code: str, namespace: str):
 # ITEM TAGS
 # =========================================================
 JAVA_TAG_TO_BEDROCK_GROUP = {
+    # Forge tags
     "forge:ores": "ore",
     "forge:ingots": "ingot",
     "forge:gems": "gem",
@@ -4010,39 +6157,49 @@ JAVA_TAG_TO_BEDROCK_GROUP = {
     "forge:rods": "stick",
     "forge:plates": "plate",
     "forge:tools": "tool",
+    "forge:tools/swords": "weapon",
+    "forge:tools/axes": "tool",
+    "forge:tools/pickaxes": "tool",
+    "forge:tools/shovels": "tool",
+    "forge:tools/hoes": "tool",
     "forge:weapons": "weapon",
     "forge:armor": "armor",
+    "forge:armors": "armor",
     "forge:food": "food",
     "forge:seeds": "seeds",
     "forge:crops": "crop",
     "forge:bones": "misc",
     "forge:string": "misc",
     "forge:feathers": "misc",
-    # NeoForge uses the same tag paths but under the "neoforge" namespace
+    "forge:storage_blocks": "misc",
+    "forge:raw_materials": "misc",
+    # NeoForge (same namespace as Forge for most)
     "neoforge:ores": "ore",
     "neoforge:ingots": "ingot",
     "neoforge:gems": "gem",
-    "neoforge:dusts": "dust",
-    "neoforge:nuggets": "nugget",
-    "neoforge:rods": "stick",
-    "neoforge:plates": "plate",
-    "neoforge:tools": "tool",
-    "neoforge:weapons": "weapon",
-    "neoforge:armor": "armor",
-    "neoforge:food": "food",
-    "neoforge:seeds": "seeds",
-    "neoforge:crops": "crop",
-    "neoforge:bones": "misc",
-    "neoforge:string": "misc",
-    "neoforge:feathers": "misc",
+    # Fabric / c: convention tags
+    "c:ores": "ore",
+    "c:ingots": "ingot",
+    "c:gems": "gem",
+    "c:dusts": "dust",
+    "c:nuggets": "nugget",
+    "c:foods": "food",
+    "c:tools": "tool",
+    "c:weapons": "weapon",
+    "c:armors": "armor",
+    # Vanilla Minecraft tags
     "minecraft:logs": "log",
+    "minecraft:logs_that_burn": "log",
     "minecraft:planks": "planks",
     "minecraft:slabs": "slab",
     "minecraft:stairs": "stair",
     "minecraft:doors": "door",
+    "minecraft:trapdoors": "door",
     "minecraft:leaves": "leaves",
     "minecraft:saplings": "sapling",
     "minecraft:flowers": "flower",
+    "minecraft:small_flowers": "flower",
+    "minecraft:tall_flowers": "flower",
     "minecraft:wool": "wool",
     "minecraft:swords": "weapon",
     "minecraft:axes": "tool",
@@ -4055,6 +6212,11 @@ JAVA_TAG_TO_BEDROCK_GROUP = {
     "minecraft:boots": "armor",
     "minecraft:coals": "misc",
     "minecraft:arrows": "misc",
+    "minecraft:beds": "misc",
+    "minecraft:banners": "misc",
+    "minecraft:music_discs": "misc",
+    "minecraft:fishes": "food",
+    "minecraft:meat": "food",
 }
 
 def extract_item_tags_from_jar(jar_path: str, namespace: str):
@@ -4183,31 +6345,22 @@ def convert_java_block_full(java_code: str, java_path: str, namespace: str):
     safe_name = sanitize_identifier(cls)
     block_id = f"{namespace}:{safe_name}"
 
-    # Extract material
-    mat_match = re.search(r'Material\.([A-Z_]+)', java_code)
-    material = JAVA_BLOCK_MATERIAL_MAP.get(mat_match.group(1) if mat_match else "", "stone")
+    props = extract_block_properties_from_java(java_code)
 
-    # Hardness / resistance
-    hardness = 2.0
-    m = re.search(r'(?:hardness|destroyTime|strength)\s*\(?\s*([0-9.]+)', java_code, re.I)
-    if m:
-        hardness = float(m.group(1))
-    resistance = hardness * 3.0
-    m2 = re.search(r'(?:resistance|explosionResistance)\s*\(?\s*([0-9.]+)', java_code, re.I)
-    if m2:
-        resistance = float(m2.group(1))
+    # Material -> sound / map_color hint
+    mat_raw = re.search(r'Material\.([A-Z_]+)', java_code)
+    material_key = mat_raw.group(1) if mat_raw else ""
+    material = JAVA_BLOCK_MATERIAL_MAP.get(material_key, "stone")
 
-    # Light emission
-    light_emission = 0
-    m3 = re.search(r'(?:lightLevel|lightEmission|light)\s*[=({]+\s*([0-9]+)', java_code, re.I)
-    if m3:
-        light_emission = min(15, int(m3.group(1)))
+    hardness = props.get("destroy_time") if props.get("destroy_time") is not None else 2.0
+    resistance = props.get("explosion_resistance") if props.get("explosion_resistance") is not None else hardness * 3.0
+    light_emission = props.get("light_emission", 0)
+    friction = props.get("friction", 0.6)
+    is_opaque = props.get("is_opaque", True)
 
-    # Friction (slipperiness)
-    friction = 0.6
-    m4 = re.search(r'(?:slipperiness|friction)\s*[=({]+\s*([0-9.]+)', java_code, re.I)
-    if m4:
-        friction = float(m4.group(1))
+    render_method = "opaque" if is_opaque else "alpha_test"
+
+    tex_match = find_best_texture_match(safe_name, "blocks")
 
     doc = {
         "format_version": BP_RP_FORMAT_VERSION,
@@ -4218,30 +6371,42 @@ def convert_java_block_full(java_code: str, java_path: str, namespace: str):
             },
             "components": {
                 "minecraft:material_instances": {
-                    "*": {"texture": find_best_texture_match(safe_name, "blocks"), "render_method": "opaque"}
+                    "*": {"texture": tex_match, "render_method": render_method}
                 },
                 "minecraft:destructible_by_mining": {"seconds_to_destroy": hardness},
                 "minecraft:destructible_by_explosion": {"explosion_resistance": resistance},
                 "minecraft:friction": friction,
                 "minecraft:light_emission": light_emission,
-                "minecraft:geometry": f"geometry.{safe_name}",
             }
         }
     }
 
-    # Log-type blocks
+    comps = doc["minecraft:block"]["components"]
+
+    # Only add geometry if a matching .geo.json actually exists on disk
+    geo_dir = os.path.join(RP_FOLDER, "geometry")
+    geo_candidates = [
+        safe_name + ".geo.json",
+        safe_name + ".json",
+    ]
+    has_geo = any(os.path.exists(os.path.join(geo_dir, c)) for c in geo_candidates)
+    if has_geo:
+        comps["minecraft:geometry"] = f"geometry.{safe_name}"
+
+    # Log / pillar blocks
     if "log" in safe_name or "pillar" in safe_name.lower():
-        doc["minecraft:block"]["components"]["minecraft:geometry"] = "geometry.log"
+        comps["minecraft:geometry"] = "geometry.log"
 
     # Block states from Java BlockStateProperties
     states = {}
     permutations = []
     if re.search(r'BlockStateProperties\.FACING|DirectionProperty', java_code, re.I):
         states["facing"] = ["north", "south", "east", "west", "up", "down"]
-        for d in ["north", "south", "east", "west"]:
+        rot_map = {"north": 0, "south": 180, "east": 90, "west": 270}
+        for d, rot in rot_map.items():
             permutations.append({
                 "condition": f'query.block_property("{namespace}:facing") == "{d}"',
-                "components": {"minecraft:transformation": {"rotation": [0, {"north":0,"south":180,"east":90,"west":270}[d], 0]}}
+                "components": {"minecraft:transformation": {"rotation": [0, rot, 0]}}
             })
     if re.search(r'BlockStateProperties\.POWERED|BooleanProperty.*power', java_code, re.I):
         states["powered"] = [False, True]
@@ -4260,13 +6425,17 @@ def convert_java_block_full(java_code: str, java_path: str, namespace: str):
             "components": {"minecraft:light_emission": 15}
         })
     if re.search(r'IntegerProperty.*age|BlockStateProperties\.AGE', java_code, re.I):
-        m_age = re.search(r'IntegerProperty\.create\("[^"]+",\s*\d+,\s*(\d+)', java_code)
+        m_age = re.search(r'IntegerProperty\.create\s*\([^,]+,\s*\d+,\s*(\d+)', java_code)
         max_age = int(m_age.group(1)) if m_age else 7
         states["age"] = list(range(max_age + 1))
 
+    # NeoForge HORIZONTAL_FACING (subset of FACING)
+    if re.search(r'HORIZONTAL_FACING|HorizontalDirectionalBlock', java_code, re.I):
+        if "facing" not in states:
+            states["facing"] = ["north", "south", "east", "west"]
+
     if states:
-        ns_states = {f"{namespace}:{k}": v for k, v in states.items()}
-        doc["minecraft:block"]["description"]["states"] = ns_states
+        doc["minecraft:block"]["description"]["states"] = {f"{namespace}:{k}": v for k, v in states.items()}
     if permutations:
         doc["minecraft:block"]["permutations"] = permutations
 
@@ -4962,17 +7131,16 @@ def run_validation_pass() -> list:
 
                 # Check geometry
                 for geo_key, geo_id in desc.get("geometry", {}).items():
-                    # Build a normalised version of the full geometry tail for matching.
-                    # geo_id is like "geometry.mymod.myentity" — strip the "geometry." prefix
-                    # and check whether any on-disk geo file contains this identifier.
                     if geo_id.startswith("geometry."):
                         geo_tail = sanitize_identifier(geo_id[len("geometry."):])
                     else:
                         geo_tail = sanitize_identifier(geo_id)
-                    # Check against full tail and also just the last segment (entity name)
                     geo_last = geo_tail.split(".")[-1] if "." in geo_tail else geo_tail
                     if (geo_tail not in geo_on_disk and geo_last not in geo_on_disk):
-                        warnings.append(f"[WARN] Geometry '{geo_id}' referenced in {fname} - no matching .geo.json found")
+                        warnings.append(
+                            f"[WARN] Geometry '{geo_id}' in {fname} has no matching .geo.json "
+                            f"(placeholder — add the geometry file to fix rendering)"
+                        )
 
                 # Check animations
                 for anim_key, anim_id in desc.get("animations", {}).items():
@@ -5077,7 +7245,97 @@ def detect_mod_id(java_files: dict) -> str:
                         return sanitize_identifier(data["id"])
                 except Exception:
                     pass
+            # Quilt: quilt.mod.json
+            if f == "quilt.mod.json":
+                try:
+                    data = json.load(open(os.path.join(root, f), encoding="utf-8"))
+                    qm = data.get("quilt_loader", {})
+                    if "id" in qm:
+                        return sanitize_identifier(qm["id"])
+                except Exception:
+                    pass
+            # Gradle build files: build.gradle / build.gradle.kts
+            if f in ("build.gradle", "build.gradle.kts"):
+                try:
+                    c = open(os.path.join(root, f), encoding="utf-8", errors="ignore").read()
+                    # archivesBaseName = 'mymod' or archivesBaseName = "mymod"
+                    for pat in [
+                        r'archivesBaseName\s*=\s*["\']([a-z0-9_-]+)["\']',
+                        r'mod_id\s*=\s*["\']([a-z0-9_-]+)["\']',
+                        r'modId\s*[=:]\s*["\']([a-z0-9_-]+)["\']',
+                    ]:
+                        m = re.search(pat, c, re.I)
+                        if m:
+                            candidate = sanitize_identifier(m.group(1))
+                            if candidate and len(candidate) >= 2:
+                                print(f"[detect_mod_id] Found mod ID in {f}: {candidate!r}")
+                                return candidate
+                except Exception:
+                    pass
+            # gradle.properties
+            if f == "gradle.properties":
+                try:
+                    c = open(os.path.join(root, f), encoding="utf-8", errors="ignore").read()
+                    for pat in [
+                        r'mod_id\s*=\s*([a-z0-9_-]+)',
+                        r'modId\s*=\s*([a-z0-9_-]+)',
+                        r'archivesBaseName\s*=\s*([a-z0-9_-]+)',
+                    ]:
+                        m = re.search(pat, c, re.I)
+                        if m:
+                            candidate = sanitize_identifier(m.group(1).strip())
+                            if candidate and len(candidate) >= 2:
+                                return candidate
+                except Exception:
+                    pass
     return ""
+
+
+def _build_resource_location_constants(java_files: dict) -> Dict[str, str]:
+    """
+    Pre-scan all Java files for ResourceLocation constant declarations and
+    return {constant_name: "namespace:path"}.
+
+    Handles:
+      new ResourceLocation("ns", "path")                           (Forge/NeoForge)
+      new ResourceLocation("ns:path")                              (single-arg)
+      ResourceLocation.fromNamespaceAndPath("ns", "path")          (NeoForge 1.21+)
+      ResourceLocation.of("ns:path", '/')                          (some Forge versions)
+      ResourceLocation.tryParse("ns:path")                         (NeoForge)
+    """
+    constants: Dict[str, str] = {}
+    _RL_TYPES = r'(?:ResourceLocation|RL|Identifier)'  # common aliases
+    for _path, code in java_files.items():
+        # Two-arg: new ResourceLocation("ns", "path") or static factory
+        for m in re.finditer(
+            rf'(?:static\s+final\s+)?{_RL_TYPES}\s+(\w+)\s*='
+            r'\s*new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+            code
+        ):
+            constants[m.group(1)] = f"{m.group(2)}:{m.group(3)}"
+        # Single-arg: new ResourceLocation("ns:path")
+        for m in re.finditer(
+            rf'(?:static\s+final\s+)?{_RL_TYPES}\s+(\w+)\s*='
+            r'\s*new\s+ResourceLocation\s*\(\s*["\']([a-z0-9_:/-][^"\']*)["\']',
+            code
+        ):
+            constants[m.group(1)] = m.group(2)
+        # fromNamespaceAndPath / of / tryParse static factories
+        for m in re.finditer(
+            rf'(?:static\s+final\s+)?{_RL_TYPES}\s+(\w+)\s*='
+            r'\s*ResourceLocation\.(?:fromNamespaceAndPath|of)\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+            code
+        ):
+            constants[m.group(1)] = f"{m.group(2)}:{m.group(3)}"
+        for m in re.finditer(
+            rf'(?:static\s+final\s+)?{_RL_TYPES}\s+(\w+)\s*='
+            r'\s*ResourceLocation\.(?:tryParse|tryBuild|of)\s*\(\s*["\']([a-z0-9_:/-][^"\']*)["\']',
+            code
+        ):
+            constants[m.group(1)] = m.group(2)
+        # MOD_ID + string concat patterns:  new ResourceLocation(MOD_ID, "entity_name")
+        # We can't resolve MOD_ID at this point — skip (handled elsewhere).
+    return constants
 
 
 def build_entity_registry(java_files: dict, namespace: str) -> dict:
@@ -5161,6 +7419,58 @@ def build_entity_registry(java_files: dict, namespace: str) -> dict:
             if m:
                 raw = m.group(1)
                 registry[cls_name] = raw if ":" in raw else f"{namespace}:{raw}"
+
+    # ── Pass 2: constant-based registry names ─────────────────────────────────
+    # Many hand-crafted mods use:
+    #   static final ResourceLocation MY_MOB = new ResourceLocation("ns", "my_mob");
+    #   REGISTER.register(MY_MOB, MyMob::new)
+    # or (NeoForge 1.21+):
+    #   REGISTER.register("my_mob", () -> EntityType.Builder.of(MyMob::new, ...).build(MY_MOB))
+    rl_constants = _build_resource_location_constants(java_files)
+    if rl_constants:
+        for _path2, code2 in java_files.items():
+            # register(CONSTANT, ClassName::new)  or  register(CONSTANT, () -> new ClassName(...))
+            for m in re.finditer(
+                r'\.register\s*\(\s*([A-Z_][A-Z0-9_]{2,})\s*,'
+                r'\s*(?:([A-Za-z0-9_]+)::new|\(\)\s*->\s*new\s+([A-Za-z0-9_]+)\s*\()',
+                code2
+            ):
+                const_name = m.group(1)
+                cls = m.group(2) or m.group(3)
+                if const_name in rl_constants and cls and cls not in ('super', 'this', 'EntityType'):
+                    rl = rl_constants[const_name]
+                    if ':' in rl and cls not in registry:
+                        registry[cls] = rl
+            # EntityType.Builder.of(MyMob::new, ...).build(CONSTANT) pattern
+            for m in re.finditer(
+                r'EntityType\.Builder[^;]*\.of\s*\(\s*([A-Za-z0-9_]+)::new[^;]*\.build\s*\(\s*([A-Z_][A-Z0-9_]{2,})\s*\)',
+                code2, re.DOTALL
+            ):
+                cls = m.group(1)
+                const_name = m.group(2)
+                if const_name in rl_constants and cls and cls not in registry:
+                    rl = rl_constants[const_name]
+                    if ':' in rl:
+                        registry[cls] = rl
+            # register("name", () -> EntityType.Builder.of(MyMob::new).build(RL_CONST))
+            # already partially covered above; also catch string key + RL const in build()
+            for m in re.finditer(
+                r'\.register\s*\(\s*["\']([a-z0-9_]+)["\']\s*,[^;]*?\.build\s*\(\s*([A-Z_][A-Z0-9_]{2,})\s*\)',
+                code2, re.DOTALL
+            ):
+                reg_name = m.group(1)
+                const_name = m.group(2)
+                if const_name in rl_constants:
+                    rl = rl_constants[const_name]
+                    ns_part = rl.split(':')[0] if ':' in rl else namespace
+                    # Find the entity class by scanning nearby ::new
+                    nearby = code2[max(0, m.start()-300):m.end()]
+                    cm = re.search(r'([A-Za-z0-9_]+)::new', nearby)
+                    if cm:
+                        cls = cm.group(1)
+                        if cls not in ('super', 'this', 'EntityType') and cls not in registry:
+                            registry[cls] = f"{ns_part}:{reg_name}"
+
     return registry
 
 
@@ -5169,9 +7479,13 @@ def build_attributes_registry(java_files: dict) -> dict:
     defaults = {"health":20.0,"attack_damage":3.0,"movement_speed":0.3,
                 "follow_range":16.0,"knockback_resistance":0.0,"armor":0.0}
     for path, code in java_files.items():
-        fname = os.path.basename(path).lower()
-        if not (any(k in fname for k in ("attribute","stats","properties")) or
-                re.search(r'(?:createAttributes|getDefaultAttributes|createMobAttributes)', code)):
+        # No filename filter — hand-crafted mods put createAttributes() directly
+        # in the entity class (e.g. DragonEntity.java), not in a dedicated file.
+        if not re.search(
+            r'(?:createAttributes|getDefaultAttributes|createMobAttributes'
+            r'|createMonsterAttributes|createAnimalAttributes|createLivingAttributes)',
+            code
+        ):
             continue
         cls_name = extract_class_name(code)
         if not cls_name: continue
@@ -6100,277 +8414,247 @@ def extract_logo_from_jar(jar_path: str) -> Optional[str]:
 
 
 # -------------------------
-# Loader / version validation
-# -------------------------
-
-# Minimum MC version supported per loader (as tuple for comparison)
-LOADER_MIN_VERSIONS: Dict[str, tuple] = {
-    "forge":    (1, 3),   # 1.3+  (not recommended below 1.12)
-    "neoforge": (1, 20),  # NeoForge only exists from 1.20.1 onward
-    "fabric":   None,     # Unsupported - warn and abort
-    "quilt":    None,     # Unsupported - warn and abort
-}
-
-# NeoForge did not exist before 1.20.1
-NEOFORGE_MIN_VERSION = (1, 20, 1)
-
-
-def detect_mc_version_from_jar(jar_path: str) -> Optional[tuple]:
-    """
-    Attempt to detect the Minecraft version from a JAR file.
-    Checks META-INF/mods.toml, META-INF/neoforge.mods.toml, or version string
-    embedded in the JAR filename itself (e.g. mymod-1.20.4-2.0.jar).
-    Returns a version tuple like (1, 20, 4) or None if not detected.
-    """
-    toml_candidates = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"]
-    try:
-        with zipfile.ZipFile(jar_path, "r") as jar:
-            names_lower = {n.lower(): n for n in jar.namelist()}
-            for candidate in toml_candidates:
-                real_name = names_lower.get(candidate.lower())
-                if not real_name:
-                    continue
-                try:
-                    with jar.open(real_name) as f:
-                        content_toml = f.read().decode("utf-8", errors="ignore")
-                    for pat in [
-                        r'loaderVersion\s*=\s*["\'\']?\[?([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-                        r'(?:dependencies\.minecraft|minecraft\.version)\s*=\s*["\'\']([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-                        r'\[dependencies\.[^\]]+\]\s*[^\[]*?versionRange\s*=\s*["\'\']?\[([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-                    ]:
-                        m = re.search(pat, content_toml, re.IGNORECASE)
-                        if m:
-                            parts = tuple(int(x) for x in m.group(1).split("."))
-                            return parts
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    fname = os.path.basename(jar_path)
-    m = re.search(r'[_\-](1\.[0-9]+(?:\.[0-9]+)?)[_\-]', fname)
-    if m:
-        parts = tuple(int(x) for x in m.group(1).split("."))
-        return parts
-
-    return None
-
-
-def validate_loader_support(loader: str, mc_version: Optional[tuple]) -> bool:
-    """
-    Validate that the detected loader (and optionally MC version) is supported.
-    Prints informative warnings/errors and returns False if the pipeline should abort.
-    """
-    UNSUPPORTED_LOADERS = {"fabric", "quilt"}
-
-    if loader in UNSUPPORTED_LOADERS:
-        print(f"\n\u274c Unsupported mod loader detected: {loader.upper()}")
-        print(  "   ModMorpher currently supports Forge and NeoForge (MCreator) mods only.")
-        print(  "   Fabric and Quilt mods use a fundamentally different architecture")
-        print(  "   and are not yet supported.\n")
-        return False
-
-    if loader == "unknown":
-        print("\n\u26a0  Could not detect mod loader from JAR.")
-        print(  "   Proceeding anyway, but results may be incomplete.")
-        return True
-
-    if loader == "neoforge":
-        if mc_version is not None and mc_version < NEOFORGE_MIN_VERSION:
-            print(f"\n\u274c NeoForge does not exist for Minecraft {'.'.join(str(x) for x in mc_version)}.")
-            print(  "   NeoForge was introduced in Minecraft 1.20.1.")
-            print(  "   If your mod targets an earlier version, it uses Forge, not NeoForge.")
-            return False
-        version_str = '.'.join(str(x) for x in mc_version) if mc_version else "unknown"
-        print(f"[loader] \u2713 NeoForge mod detected (MC {version_str}) -- full support enabled.")
-        if mc_version is None:
-            print("   \u26a0  Could not detect MC version from JAR; assuming 1.20.1+.")
-        return True
-
-    if loader == "forge":
-        if mc_version is not None:
-            version_str = '.'.join(str(x) for x in mc_version)
-            if mc_version >= (1, 18):
-                print(f"[loader] \u2713 Forge mod detected (MC {version_str}) -- best results expected.")
-            elif mc_version >= (1, 12):
-                print(f"[loader] \u26a0  Forge mod detected (MC {version_str}) -- manual work may be needed.")
-            else:
-                print(f"[loader] \u26a0  Forge mod detected (MC {version_str}) -- NOT RECOMMENDED. "
-                      "Very old versions may produce incomplete output.")
-        else:
-            print("[loader] \u2713 Forge mod detected (MC version unknown).")
-        return True
-
-    print(f"[loader] \u26a0  Unknown loader '{loader}' -- proceeding with best-effort conversion.")
-    return True
-
-
-# -------------------------
 # Main pipeline
 # -------------------------
 def run_pipeline():
+    _orig = _logger._original_print          # always-visible channel
+
+    # ── Discover JAR ─────────────────────────────────────────────────────────
     jar_path = find_jar_file(".")
     if jar_path:
         jar_base_raw = os.path.splitext(os.path.basename(jar_path))[0]
-        print(f"Found JAR: {jar_path} (using '{jar_base_raw}' as pack name and namespace)")
+        _orig(f"  📦  Found JAR: {os.path.basename(jar_path)}")
     else:
         jar_base_raw = os.path.split(os.getcwd())[-1]
-        print("❌ No .jar file found. Continuing without JAR asset copying. Using current folder name as pack name/namespace")
+        _orig("  ⚠   No .jar found — using folder name as namespace, skipping JAR assets")
 
-    # display name (for manifests) and namespace identifier
     pack_display_name = jar_base_raw
     namespace = sanitize_identifier(jar_base_raw) or "converted"
-
     ensure_dirs()
 
+    # ── JAR assets ───────────────────────────────────────────────────────────
     if jar_path:
-        jar_loader = detect_loader_from_jar(jar_path)
-        mc_version = detect_mc_version_from_jar(jar_path)
-        if not validate_loader_support(jar_loader, mc_version):
-            print("\nAborting pipeline due to unsupported loader. See above for details.")
-            return
-        copy_assets_from_jar(jar_path, RP_FOLDER)
-        copy_geckolib_animations_from_jar(jar_path, RP_FOLDER)
-        logo = extract_logo_from_jar(jar_path)
-        if logo:
-            try:
-                # Place logo -> pack_icon.png into BP and RP using the resizing helper
-                dest_bp = os.path.join(BP_FOLDER, "pack_icon.png")
-                dest_rp = os.path.join(RP_FOLDER, "pack_icon.png")
-                tmp_fixed_dir = os.path.join(".temp_icon_fixed")
-                tmp_fixed = os.path.join(tmp_fixed_dir, "pack_icon.png")
-                ok = ensure_and_fix_pack_icon(logo, tmp_fixed)
-                if ok or os.path.exists(tmp_fixed):
-                    os.makedirs(os.path.dirname(dest_bp), exist_ok=True)
-                    os.makedirs(os.path.dirname(dest_rp), exist_ok=True)
-                    shutil.copy(tmp_fixed, dest_bp)
-                    shutil.copy(tmp_fixed, dest_rp)
-                    print(f"✓ Extracted, fixed, and copied pack_icon.png to BP and RP.")
-                else:
-                    # fallback: copy unmodified (warning printed by ensure helper)
-                    shutil.copy(logo, dest_bp)
-                    shutil.copy(logo, dest_rp)
-                    print(f"✓ Copied pack icon without resizing (PIL not available).")
-                shutil.rmtree(".temp_logo_extract", ignore_errors=True)
-                shutil.rmtree(tmp_fixed_dir, ignore_errors=True)
-            except Exception as e:
-                print(f"⚠ Failed to copy pack icon: {e}")
+        with _logger.phase("Extracting JAR assets", total=0, unit="step", colour="blue"):
+            jar_loader = detect_loader_from_jar(jar_path)
+            print(f"[loader] {jar_loader}")
+            copy_assets_from_jar(jar_path, RP_FOLDER)
+            copy_geckolib_animations_from_jar(jar_path, RP_FOLDER)
+            logo = extract_logo_from_jar(jar_path)
+            if logo:
+                try:
+                    dest_bp = os.path.join(BP_FOLDER, "pack_icon.png")
+                    dest_rp = os.path.join(RP_FOLDER, "pack_icon.png")
+                    tmp_fixed_dir = ".temp_icon_fixed"
+                    tmp_fixed = os.path.join(tmp_fixed_dir, "pack_icon.png")
+                    ok = ensure_and_fix_pack_icon(logo, tmp_fixed)
+                    if ok or os.path.exists(tmp_fixed):
+                        os.makedirs(os.path.dirname(dest_bp), exist_ok=True)
+                        os.makedirs(os.path.dirname(dest_rp), exist_ok=True)
+                        shutil.copy(tmp_fixed, dest_bp)
+                        shutil.copy(tmp_fixed, dest_rp)
+                    else:
+                        shutil.copy(logo, dest_bp)
+                        shutil.copy(logo, dest_rp)
+                        print("⚠ Copied pack icon without resizing (PIL not available)")
+                    shutil.rmtree(".temp_logo_extract", ignore_errors=True)
+                    shutil.rmtree(tmp_fixed_dir, ignore_errors=True)
+                except Exception as e:
+                    print(f"⚠ Failed to copy pack icon: {e}")
 
-    # Normalize existent RP files (geometry/animations) so identifiers are safe and consistent
-    normalize_geometry_file_identifiers()
-    sanitize_animation_keys_in_files()
-    fix_animation_format_versions()
+    # ── Normalise RP geometry / animations ───────────────────────────────────
+    with _logger.phase("Normalising RP assets", total=0, unit="step", colour="blue"):
+        normalize_geometry_file_identifiers()
+        sanitize_animation_keys_in_files()
+        fix_animation_format_versions()
 
-    gecko_maps = build_geckolib_mappings(".")
-    geom_file_map, geom_ns_map = load_geometry_identifiers()
-    anim_key_map = load_animation_keys()
+    # ── Convert ALL extracted models to GeckoLib in rp/geometry/ ─────────────
+    with _logger.phase("Sweeping models → rp/geometry", total=0, unit="step", colour="blue"):
+        normalise_all_geometry_to_geckolib(RP_FOLDER, namespace)
 
+    # ── Index all RP assets for aggressive texture/geometry matching ──────────
+    with _logger.phase("Indexing RP assets", total=0, unit="step", colour="blue"):
+        build_rp_asset_index()
+
+    # ── Read + pre-scan Java source ───────────────────────────────────────────
     stats = {
         "converted_entities_bp": [],
         "converted_entities_rp": [],
-        "skipped_files": [],
-        "missing_geometry": [],
-        "errors": [],
-        "converted_items": [],
-        "converted_blocks": []
+        "skipped_files":         [],
+        "missing_geometry":      [],
+        "errors":                [],
+        "converted_items":       [],
+        "converted_blocks":      [],
     }
 
-    java_files = read_all_java_files(".")
+    with _logger.phase("Reading Java source", total=0, unit="file", colour="blue"):
+        java_files = read_all_java_files(".")
+        global _ALL_JAVA_FILES
+        _ALL_JAVA_FILES = java_files
 
-    # Pre-scan all files to build cross-file registries
-    detected_mod_id = run_prescan(java_files, namespace)
-    if detected_mod_id and detected_mod_id != namespace:
-        print(f"[prescan] Using detected mod_id '{detected_mod_id}' as namespace (was '{namespace}')")
-        namespace = detected_mod_id
+    with _logger.phase("Pre-scanning registries", total=0, unit="step", colour="blue"):
+        detected_mod_id = run_prescan(java_files, namespace)
+        if detected_mod_id and detected_mod_id != namespace:
+            print(f"[prescan] mod_id → '{detected_mod_id}'")
+            namespace = detected_mod_id
+        build_renderer_entity_map()
 
-    for path, code in java_files.items():
-        fname = os.path.basename(path)
-        lname = fname.lower()
-        try:
-            is_item = lname.endswith("item.java") or (("_item" in lname) or ("item" in lname and lname.count("item") == 1 and not lname.endswith("model.java")))
-            is_block = lname.endswith("block.java") or ("block" in lname and "model" not in lname)
-            # Guard: don't treat a file as an entity if it already looks like an item or block,
-            # since item/block classes often extend base classes that trip is_likely_entity.
-            entity_candidate = is_likely_entity(code, path) and not (is_item or is_block)
+    # ── Convert LayerDefinition models to GeckoLib geometry ──────────────────
+    # MUST run BEFORE building gecko mappings, so all handmade models are converted
+    # and indexed before entities are assigned their geometry.
+    with _logger.phase("Converting LayerDefinition models", total=0, unit="step", colour="blue"):
+        global _LAYERDEF_GEO_MAP
+        _LAYERDEF_GEO_MAP = scan_and_convert_layerdefinition_models(java_files, namespace)
+        if _LAYERDEF_GEO_MAP:
+            # Refresh geometry maps so the newly written files are discoverable
+            geom_file_map, geom_ns_map = load_geometry_identifiers()
+            build_rp_asset_index()
 
-            if is_item:
-                convert_java_item_full(code, path, namespace)
-                stats["converted_items"].append(path)
-            if is_block:
-                convert_java_block_full(code, path, namespace)
-                stats["converted_blocks"].append(path)
-            if entity_candidate:
-                cls = extract_class_name(code) or os.path.splitext(fname)[0]
-                # Priority: prescan registry > setRegistryName > class name
-                if cls and cls in ENTITY_REGISTRY:
-                    entity_identifier = ENTITY_REGISTRY[cls]
-                else:
-                    m = re.search(r'setRegistryName\s*\(\s*["\']([a-z0-9_:-]+)["\']', code, re.I)
-                    if m:
-                        raw = m.group(1)
-                        entity_identifier = raw if ":" in raw else f"{namespace}:{raw}"
+    # ── Build in-memory maps ──────────────────────────────────────────────────
+    # This runs AFTER all model conversions (extracted + LayerDef) so gecko_maps
+    # includes all available geometries for entity assignment.
+    with _logger.phase("Building asset maps", total=0, unit="step", colour="blue"):
+        gecko_maps    = build_geckolib_mappings(".")
+        geom_file_map, geom_ns_map = load_geometry_identifiers()
+        anim_key_map  = load_animation_keys()
+
+    # ── Main conversion loop ──────────────────────────────────────────────────
+    total_files = len(java_files)
+    with _logger.phase("Converting Java files", total=total_files, unit="file", colour="cyan") as bar:
+        for path, code in java_files.items():
+            fname  = os.path.basename(path)
+            lname  = fname.lower()
+            bar.set_postfix_str(fname[:38])
+            try:
+                fname_item_hint   = lname.endswith("item.java")  or "_item"  in lname
+                fname_block_hint  = lname.endswith("block.java") or "_block" in lname
+                fname_entity_hint = any(k in lname for k in ENTITY_OVERRIDE_KEYWORDS)
+                fname_noise       = any(k in lname for k in NON_ENTITY_KEYWORDS) and not fname_entity_hint
+
+                item_content_signals = [
+                    bool(re.search(r'\bextends\s+(?:Item|SwordItem|PickaxeItem|ShovelItem|AxeItem|HoeItem|ArmorItem|BowItem|ShieldItem|FoodOnAStickItem|ThrowablePotionItem|TieredItem|DiggerItem|BlockItem|DoubleHighBlockItem|StandingAndWallBlockItem)\b', code)),
+                    bool(re.search(r'Item\.Properties\(\)|new\s+Item\.Properties\b|Item\.Properties\.of\b', code)),
+                    bool(re.search(r'\.stacksTo\s*\(|\.durability\s*\(|FoodProperties\.Builder\b', code)),
+                    bool(re.search(r'@Override\s+public\s+\w+\s+use\s*\(Level|InteractionResultHolder<ItemStack>', code)),
+                    fname_item_hint,
+                ]
+                is_item = sum(item_content_signals) >= 2 or (fname_item_hint and sum(item_content_signals) >= 1)
+
+                block_content_signals = [
+                    bool(re.search(r'\bextends\s+(?:Block|BaseBlock|HalfTransparentBlock|BushBlock|FlowerBlock|SaplingBlock|CropBlock|TrapDoorBlock|DoorBlock|FenceBlock|WallBlock|StairBlock|SlabBlock|PressurePlateBlock|ButtonBlock|LeverBlock|TorchBlock|RedStoneWireBlock|ChestBlock|FurnaceBlock|LiquidBlock|GrassBlock|RotatedPillarBlock|HorizontalDirectionalBlock|DirectionalBlock)\b', code)),
+                    bool(re.search(r'BlockBehaviour\.Properties|Block\.Properties\s*\.of\b|BlockBehaviour\.Properties\.of\b', code)),
+                    bool(re.search(r'\.strength\s*\(|\.noCollission\s*\(|\.lightLevel\s*\(|\.randomTicks\s*\(', code)),
+                    bool(re.search(r'@Override\s+public\s+\w+\s+use\s*\(BlockState|getStateForPlacement\s*\(', code)),
+                    fname_block_hint,
+                ]
+                is_block = sum(block_content_signals) >= 2 or (fname_block_hint and sum(block_content_signals) >= 1)
+
+                entity_candidate = (
+                    is_likely_entity(code, path)
+                    and not (is_item  and not fname_entity_hint)
+                    and not (is_block and not fname_entity_hint)
+                    and not fname_noise
+                )
+
+                if is_item:
+                    convert_java_item_full(code, path, namespace)
+                    stats["converted_items"].append(path)
+                if is_block:
+                    convert_java_block_full(code, path, namespace)
+                    stats["converted_blocks"].append(path)
+                if entity_candidate:
+                    cls = extract_class_name(code) or os.path.splitext(fname)[0]
+                    if cls and cls in ENTITY_REGISTRY:
+                        entity_identifier = ENTITY_REGISTRY[cls]
                     else:
-                        entity_identifier = f"{namespace}:{sanitize_identifier(cls)}"
-                convert_java_to_bedrock(path, entity_identifier, gecko_maps, geom_file_map, geom_ns_map, anim_key_map, stats)
-        except Exception as e:
-            print(f"Error processing {path}: {e}")
-            stats["errors"].append(f"{path}:{e}")
+                        reg_name = None
+                        for reg_pat in [
+                            r'setRegistryName\s*\(\s*["\']([a-z0-9_:-]+)["\']',
+                            r'\.register\s*\(\s*["\']([a-z0-9_]+)["\']\s*,\s*[^;]*?' + re.escape(cls or "") + r'::new',
+                            r'EntityType\.Builder[^;]*\.build\s*\(\s*["\']([a-z0-9_]+)["\']',
+                        ]:
+                            m = re.search(reg_pat, code, re.I | re.DOTALL)
+                            if m:
+                                raw = m.group(1)
+                                reg_name = raw if ":" in raw else f"{namespace}:{raw}"
+                                break
+                        entity_identifier = reg_name or f"{namespace}:{sanitize_identifier(cls)}"
+                    convert_java_to_bedrock(path, entity_identifier, gecko_maps, geom_file_map, geom_ns_map, anim_key_map, stats)
 
-    generate_texture_registry(pack_display_name)
-    generate_sounds_registry(namespace)
+            except Exception as e:
+                print(f"❌ Error processing {fname}: {e}")
+                stats["errors"].append(f"{path}: {e}")
+            finally:
+                bar.update(1)
+
+    # ── Post-processing ───────────────────────────────────────────────────────
+    with _logger.phase("Writing registries & lang", total=0, unit="step", colour="blue"):
+        generate_texture_registry(pack_display_name)
+        generate_sounds_registry(namespace)
+        convert_lang_files()
 
     if jar_path:
-        process_loot_tables_from_jar(jar_path, namespace)
-        process_recipes_from_jar(jar_path, namespace)
-        extract_item_tags_from_jar(jar_path, namespace)
-        process_structures_from_jar(jar_path, namespace, java_files=java_files)
+        with _logger.phase("Processing loot / recipes / tags", total=0, unit="step", colour="blue"):
+            process_loot_tables_from_jar(jar_path, namespace)
+            process_recipes_from_jar(jar_path, namespace)
+            extract_item_tags_from_jar(jar_path, namespace)
 
-    convert_lang_files()
+        with _logger.phase("Converting structures", total=0, unit="step", colour="blue"):
+            process_structures_from_jar(jar_path, namespace, java_files=java_files)
 
-    write_manifest_for(BP_FOLDER, pack_display_name, "BP")
-    write_manifest_for(RP_FOLDER, pack_display_name, "RP")
+    with _logger.phase("Writing manifests", total=0, unit="step", colour="blue"):
+        write_manifest_for(BP_FOLDER, pack_display_name, "BP")
+        write_manifest_for(RP_FOLDER, pack_display_name, "RP")
 
-    # Summary
-    print("\n--- Conversion summary ---")
-    print(f"BP entities written: {len(stats['converted_entities_bp'])}")
-    print(f"RP entities written: {len(stats['converted_entities_rp'])}")
-    print(f"Items converted: {len(stats['converted_items'])}")
-    print(f"Blocks converted: {len(stats['converted_blocks'])}")
-    loot_dir = os.path.join(BP_FOLDER, "loot_tables", "entities")
+    # ── Validation ────────────────────────────────────────────────────────────
+    validation_warnings = []
+    with _logger.phase("Validating output", total=0, unit="step", colour="blue"):
+        validation_warnings = run_validation_pass()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    loot_dir   = os.path.join(BP_FOLDER, "loot_tables", "entities")
     loot_count = len(os.listdir(loot_dir)) if os.path.isdir(loot_dir) else 0
-    print(f"Loot tables converted: {loot_count}")
-    recipe_dir = os.path.join(BP_FOLDER, "recipes")
+    recipe_dir   = os.path.join(BP_FOLDER, "recipes")
     recipe_count = len(os.listdir(recipe_dir)) if os.path.isdir(recipe_dir) else 0
-    print(f"Recipes converted: {recipe_count}")
-    spawn_dir = os.path.join(BP_FOLDER, "spawn_rules")
+    spawn_dir   = os.path.join(BP_FOLDER, "spawn_rules")
     spawn_count = len(os.listdir(spawn_dir)) if os.path.isdir(spawn_dir) else 0
-    print(f"Spawn rules generated: {spawn_count}")
-    struct_dir = os.path.join(BP_FOLDER, "structures")
+    struct_dir  = os.path.join(BP_FOLDER, "structures")
     struct_count = len([f for f in os.listdir(struct_dir) if f.endswith(".mcstructure")]) if os.path.isdir(struct_dir) else 0
-    feat_count = len(os.listdir(os.path.join(BP_FOLDER, "features"))) if os.path.isdir(os.path.join(BP_FOLDER, "features")) else 0
+    feat_count  = len(os.listdir(os.path.join(BP_FOLDER, "features"))) if os.path.isdir(os.path.join(BP_FOLDER, "features")) else 0
+
+    _orig("")
+    _orig("  ╔══════════════════════════════════════════╗")
+    _orig("  ║         ModMorpher — Conversion Done     ║")
+    _orig("  ╠══════════════════════════════════════════╣")
+    _orig(f"  ║  BP entities   {len(stats['converted_entities_bp']):>4}                        ║")
+    _orig(f"  ║  RP entities   {len(stats['converted_entities_rp']):>4}                        ║")
+    _orig(f"  ║  Items         {len(stats['converted_items']):>4}                        ║")
+    _orig(f"  ║  Blocks        {len(stats['converted_blocks']):>4}                        ║")
+    _orig(f"  ║  Loot tables   {loot_count:>4}                        ║")
+    _orig(f"  ║  Recipes       {recipe_count:>4}                        ║")
+    _orig(f"  ║  Spawn rules   {spawn_count:>4}                        ║")
     if struct_count:
-        print(f"Structures converted: {struct_count} .mcstructure + {feat_count} feature/rule JSONs")
-    print(f"Files skipped (likely non-entity helpers): {len(stats['skipped_files'])}")
-    if stats['missing_geometry']:
-        print(f"Entities skipped for RP (missing geometry): {len(stats['missing_geometry'])}")
-        for j, ent in stats['missing_geometry'][:20]:
-            print(f" - {ent}  (java: {j})")
-    if stats['errors']:
-        print(f"Errors encountered: {len(stats['errors'])}")
-        for e in stats['errors'][:10]:
-            print(" -", e)
-    # Validation pass
-    validation_warnings = run_validation_pass()
+        _orig(f"  ║  Structures    {struct_count:>4}  ({feat_count} feature JSONs)   ║")
+    _orig("  ╚══════════════════════════════════════════╝")
+
+    if stats["missing_geometry"]:
+        _orig(f"\n  ⚠  {len(stats['missing_geometry'])} entity/entities using placeholder geometry:")
+        for j, ent in stats["missing_geometry"][:20]:
+            _orig(f"      • {ent}  ← needs .geo.json")
+
+    if stats["errors"]:
+        _orig(f"\n  ❌  {len(stats['errors'])} error(s) during conversion:")
+        for e in stats["errors"][:10]:
+            _orig(f"      • {e}")
+
     if validation_warnings:
-        print(f"\n--- Validation warnings ({len(validation_warnings)}) ---")
-        for w in validation_warnings:
-            print(w)
+        _orig(f"\n  ⚠  {len(validation_warnings)} validation warning(s):")
+        for w in validation_warnings[:20]:
+            _orig(f"      {w}")
     else:
-        print("\n✓ Validation passed - no missing references found")
-        print("Zipping Finished Addon!")
-        shutil.make_archive("Bedrock_Pack", "zip", "Bedrock_Pack")
-        shutil.move("Bedrock_Pack.zip", "Bedrock_Pack.mcaddon")
-    print("--- done ---\n")
+        _orig("\n  ✓  Validation passed — no broken references")
+
+    _orig("")
+
     shutil.make_archive("Bedrock_Pack", "zip", "Bedrock_Pack")
     shutil.move("Bedrock_Pack.zip", "Bedrock_Pack.mcaddon")
 

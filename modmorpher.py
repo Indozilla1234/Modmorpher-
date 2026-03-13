@@ -963,79 +963,173 @@ def convert_vanilla_model_to_geckolib(classic: dict, model_name: str = "model") 
     Convert a vanilla Minecraft block/entity model JSON to GeckoLib .geo.json format.
     Works on any Blockbench-exported or MCreator-generated vanilla model.
     """
-    bones = []
+    try:
+        bones = []
+        elements = classic.get("elements", [])
+        groups = classic.get("groups", [])
+        tex_size = classic.get("texture_size", [16, 16])
 
-    elements = classic.get("elements", [])
-    groups   = classic.get("groups", [])
-    tex_size = classic.get("texture_size", [16, 16])
+        if not elements and not groups:
+            raise ValueError("Model must contain either 'elements' or 'groups'")
 
-    def extract_uv(element: dict):
-        faces = element.get("faces", {})
-        north = faces.get("north", {}).get("uv", [0, 0, 16, 16])
-        return [north[0], north[1]]
+        def extract_uv(element: dict) -> list:
+            """Extract UV coordinates from element faces, preferring north face."""
+            faces = element.get("faces", {})
+            # Try north face first, then any available face
+            for face_name in ["north", "south", "east", "west", "up", "down"]:
+                if face_name in faces:
+                    face_data = faces[face_name]
+                    uv = face_data.get("uv", [0, 0, 16, 16])
+                    # Ensure UV is valid
+                    if isinstance(uv, list) and len(uv) >= 4:
+                        return [float(uv[0]), float(uv[1])]
+            # Fallback
+            return [0.0, 0.0]
 
-    def convert_rotation(rot: dict) -> dict:
-        axis  = rot.get("axis", "x")
-        angle = rot.get("angle", 0)
-        return {
-            "x": angle if axis == "x" else 0,
-            "y": angle if axis == "y" else 0,
-            "z": angle if axis == "z" else 0,
-        }
+        def convert_rotation(rot: dict) -> dict:
+            """Convert rotation dict to GeckoLib format."""
+            if not isinstance(rot, dict):
+                return {"x": 0, "y": 0, "z": 0}
 
-    def element_to_cube(el: dict) -> dict:
-        from_pos = el["from"]
-        to_pos   = el["to"]
-        cube = {
-            "origin": [from_pos[0] - 8, from_pos[1], from_pos[2] - 8],
-            "size":   [to_pos[0] - from_pos[0], to_pos[1] - from_pos[1], to_pos[2] - from_pos[2]],
-            "uv":     extract_uv(el),
-        }
-        if "rotation" in el:
-            cube["rotation"] = convert_rotation(el["rotation"])
-        return cube
+            axis = rot.get("axis", "x")
+            angle = rot.get("angle", 0)
 
-    def process_group(group):
-        if isinstance(group, int):
-            return  # bare element index at top level — handled below
-        bone = {
-            "name":   group.get("name", "bone"),
-            "pivot":  [group["origin"][0] - 8, group["origin"][1], group["origin"][2] - 8],
-            "cubes":  [],
-        }
-        for child in group.get("children", []):
-            if isinstance(child, int) and child < len(elements):
-                bone["cubes"].append(element_to_cube(elements[child]))
-            elif isinstance(child, dict):
-                process_group(child)  # nested groups become sibling bones
-        bones.append(bone)
+            # Ensure angle is numeric
+            try:
+                angle = float(angle)
+            except (ValueError, TypeError):
+                angle = 0
 
-    if groups:
-        for group in groups:
-            process_group(group)
-    else:
-        # No groups — wrap everything in a single root bone
-        root = {"name": "root", "pivot": [0, 0, 0], "cubes": []}
-        for el in elements:
-            root["cubes"].append(element_to_cube(el))
-        bones.append(root)
+            rotation = {"x": 0, "y": 0, "z": 0}
+            if axis in ["x", "y", "z"]:
+                rotation[axis] = angle
+            return rotation
 
-    return {
-        "format_version": "1.12.0",
-        "minecraft:geometry": [
-            {
-                "description": {
-                    "identifier":            f"geometry.{model_name}",
-                    "texture_width":         tex_size[0],
-                    "texture_height":        tex_size[1],
-                    "visible_bounds_width":  2,
-                    "visible_bounds_height": 2,
-                    "visible_bounds_offset": [0, 1, 0],
-                },
-                "bones": bones,
+        def element_to_cube(el: dict) -> dict:
+            """Convert a model element to a GeckoLib cube."""
+            if not isinstance(el, dict) or "from" not in el or "to" not in el:
+                raise ValueError(f"Invalid element structure: {el}")
+
+            from_pos = el["from"]
+            to_pos = el["to"]
+
+            # Validate coordinates
+            if not (isinstance(from_pos, list) and isinstance(to_pos, list) and
+                    len(from_pos) >= 3 and len(to_pos) >= 3):
+                raise ValueError(f"Invalid from/to coordinates in element: {el}")
+
+            # Convert to GeckoLib coordinate system (subtract 8 for centering)
+            cube = {
+                "origin": [float(from_pos[0]) - 8, float(from_pos[1]), float(from_pos[2]) - 8],
+                "size": [float(to_pos[0]) - float(from_pos[0]),
+                        float(to_pos[1]) - float(from_pos[1]),
+                        float(to_pos[2]) - float(from_pos[2])],
+                "uv": extract_uv(el),
             }
-        ],
-    }
+
+            # Add rotation if present
+            if "rotation" in el:
+                cube["rotation"] = convert_rotation(el["rotation"])
+
+            return cube
+
+        def process_group(group, parent_pivot=[0, 0, 0]):
+            """Recursively process model groups into bones."""
+            if isinstance(group, int):
+                # Handle bare element index at top level
+                if 0 <= group < len(elements):
+                    bone = {
+                        "name": f"bone_{group}",
+                        "pivot": [0.0, 0.0, 0.0],
+                        "cubes": [element_to_cube(elements[group])],
+                    }
+                    bones.append(bone)
+                return
+
+            if not isinstance(group, dict):
+                return
+
+            # Get group properties with defaults
+            group_name = group.get("name", "bone")
+            origin = group.get("origin", [0, 0, 0])
+
+            if not isinstance(origin, list) or len(origin) < 3:
+                origin = [0, 0, 0]
+
+            # Convert pivot to GeckoLib coordinates
+            pivot = [float(origin[0]) - 8, float(origin[1]), float(origin[2]) - 8]
+
+            bone = {
+                "name": group_name,
+                "pivot": pivot,
+                "cubes": [],
+            }
+
+            # Process children
+            children = group.get("children", [])
+            if not isinstance(children, list):
+                children = []
+
+            for child in children:
+                if isinstance(child, int) and 0 <= child < len(elements):
+                    # Direct element reference
+                    bone["cubes"].append(element_to_cube(elements[child]))
+                elif isinstance(child, dict):
+                    # Nested group - process recursively
+                    process_group(child)
+
+            # Only add bone if it has cubes or children
+            if bone["cubes"]:
+                bones.append(bone)
+
+        # Process groups or create root bone from elements
+        if groups:
+            for group in groups:
+                process_group(group)
+        else:
+            # No groups - wrap all elements in a single root bone
+            root = {"name": "root", "pivot": [0.0, 0.0, 0.0], "cubes": []}
+            for el in elements:
+                try:
+                    root["cubes"].append(element_to_cube(el))
+                except ValueError as e:
+                    print(f"[model-convert] Skipping invalid element: {e}")
+                    continue
+            if root["cubes"]:
+                bones.append(root)
+
+        if not bones:
+            raise ValueError("No valid bones could be created from the model")
+
+        # Validate texture size
+        if not isinstance(tex_size, list) or len(tex_size) < 2:
+            tex_size = [16, 16]
+
+        try:
+            tex_width = int(tex_size[0])
+            tex_height = int(tex_size[1])
+        except (ValueError, TypeError):
+            tex_width, tex_height = 16, 16
+
+        return {
+            "format_version": "1.12.0",
+            "minecraft:geometry": [
+                {
+                    "description": {
+                        "identifier": f"geometry.{model_name}",
+                        "texture_width": tex_width,
+                        "texture_height": tex_height,
+                        "visible_bounds_width": 2,
+                        "visible_bounds_height": 2,
+                        "visible_bounds_offset": [0, 1, 0],
+                    },
+                    "bones": bones,
+                }
+            ],
+        }
+
+    except Exception as e:
+        raise ValueError(f"Failed to convert vanilla model '{model_name}': {str(e)}") from e
 
 
 def _extract_call_args(text: str, call_start: int, n_args: int) -> Optional[List[str]]:
@@ -1140,64 +1234,220 @@ def convert_layerdefinition_to_geckolib(
 
     Returns None if no LayerDefinition content is found.
     """
-    if 'LayerDefinition' not in java_code and 'MeshDefinition' not in java_code:
-        return None
-
-    LAYER_METHOD_NAMES = [
-        'createBodyLayer', 'createBodyModel', 'createMeshes', 'createLayers',
-        'createLayer', 'createModel', 'createModelData', 'bakeRoot',
-    ]
-    body = _extract_method_body(java_code, LAYER_METHOD_NAMES)
-    if body is None:
-        if 'addOrReplaceChild' not in java_code:
+    try:
+        if not isinstance(java_code, str) or not java_code.strip():
             return None
-        body = java_code
 
-    # Texture dimensions
-    tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', body)
-    if not tex_m:
-        tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', java_code)
-    tex_w = int(tex_m.group(1)) if tex_m else 64
-    tex_h = int(tex_m.group(2)) if tex_m else 32
+        if 'LayerDefinition' not in java_code and 'MeshDefinition' not in java_code:
+            return None
 
-    # Root variable
-    root_var_m = re.search(r'(\w+)\s*=\s*\w+\.getRoot\s*\(\)', body)
-    root_var = root_var_m.group(1) if root_var_m else 'partdefinition'
+        LAYER_METHOD_NAMES = [
+            'createBodyLayer', 'createBodyModel', 'createMeshes', 'createLayers',
+            'createLayer', 'createModel', 'createModelData', 'bakeRoot',
+        ]
+        body = _extract_method_body(java_code, LAYER_METHOD_NAMES)
+        if body is None:
+            if 'addOrReplaceChild' not in java_code:
+                return None
+            body = java_code
 
-    var_to_bone: Dict[str, dict] = {
-        root_var: {'name': '__root__', 'pivot': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0], 'cubes': []}
-    }
-    var_to_parent_var: Dict[str, str] = {}
+        # Texture dimensions with better validation
+        tex_w, tex_h = 64, 32
+        tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', body)
+        if not tex_m:
+            tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', java_code)
+        if tex_m:
+            try:
+                tex_w = int(tex_m.group(1))
+                tex_h = int(tex_m.group(2))
+            except (ValueError, IndexError):
+                pass
 
-    CALL_START = re.compile(r'(\w+)\s*=\s*(\w+)\.addOrReplaceChild\s*\(')
-    for cs in CALL_START.finditer(body):
-        var_name   = cs.group(1)
-        parent_var = cs.group(2)
-        try:
-            paren_start = body.index('(', cs.end() - 1)
-        except ValueError:
-            continue
-        depth, i = 0, paren_start
-        while i < len(body):
-            if body[i] == '(':
-                depth += 1
-            elif body[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        args_content = body[paren_start + 1:i]
+        # Root variable with validation
+        root_var_m = re.search(r'(\w+)\s*=\s*\w+\.getRoot\s*\(\)', body)
+        root_var = root_var_m.group(1) if root_var_m else 'partdefinition'
 
-        name_m = re.search(r'["\']([^"\']+)["\']', args_content)
-        bone_name = name_m.group(1) if name_m else var_name
+        var_to_bone: Dict[str, dict] = {
+            root_var: {'name': '__root__', 'pivot': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0], 'cubes': []}
+        }
+        var_to_parent_var: Dict[str, str] = {}
 
-        pivot = [0.0, 0.0, 0.0]
-        rotation = [0.0, 0.0, 0.0]
+        # Process addOrReplaceChild calls
+        CALL_START = re.compile(r'(\w+)\s*=\s*(\w+)\.addOrReplaceChild\s*\(')
+        for cs in CALL_START.finditer(body):
+            var_name = cs.group(1)
+            parent_var = cs.group(2)
 
-        pose_m = re.search(
-            r'PartPose\.offset\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)',
-            args_content
+            try:
+                paren_start = body.index('(', cs.end() - 1)
+            except ValueError:
+                continue
+
+            depth, i = 0, paren_start
+            while i < len(body):
+                if body[i] == '(':
+                    depth += 1
+                elif body[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            args_content = body[paren_start + 1:i]
+
+            name_m = re.search(r'["\']([^"\']+)["\']', args_content)
+            bone_name = name_m.group(1) if name_m else var_name
+
+            pivot = [0.0, 0.0, 0.0]
+            rotation = [0.0, 0.0, 0.0]
+
+            # Parse PartPose.offset
+            pose_m = re.search(
+                r'PartPose\.offset\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)',
+                args_content
+            )
+            if pose_m:
+                for idx, grp in enumerate(pose_m.groups()):
+                    v = _parse_java_float(grp.strip())
+                    if v is not None:
+                        pivot[idx] = v
+
+            # Parse PartPose.offsetAndRotation
+            rot_idx = args_content.find('PartPose.offsetAndRotation')
+            if rot_idx != -1:
+                rot_args = _extract_call_args(args_content, rot_idx, 6)
+                if rot_args and len(rot_args) >= 6:
+                    for idx in range(3):
+                        v = _parse_java_float(rot_args[idx].strip())
+                        if v is not None:
+                            pivot[idx] = v
+                    for idx in range(3, 6):
+                        deg = _eval_rot_expr(rot_args[idx].strip())
+                        if deg is not None:
+                            rotation[idx - 3] = round(deg, 4)
+
+            # Process cubes
+            cubes: list = []
+            cur_u, cur_v = 0, 0
+            for tex_m2 in re.finditer(r'\.texOffs\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', args_content):
+                try:
+                    cur_u = int(tex_m2.group(1))
+                    cur_v = int(tex_m2.group(2))
+                except (ValueError, IndexError):
+                    continue
+
+                after = args_content[tex_m2.end():]
+                ab = re.match(
+                    r'\s*\.addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
+                    r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
+                    after
+                )
+                if ab:
+                    try:
+                        vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
+                        cubes.append({
+                            "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
+                            "size":   vals[3:6],
+                            "uv":     [cur_u, cur_v],
+                        })
+                    except (ValueError, TypeError, IndexError):
+                        pass
+
+            # Handle bare addBox calls
+            for ab in re.finditer(
+                r'(?<!\w)addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
+                r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
+                args_content
+            ):
+                try:
+                    vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
+                    candidate = {
+                        "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
+                        "size":   vals[3:6],
+                        "uv":     [cur_u, cur_v],
+                    }
+                    if candidate not in cubes:
+                        cubes.append(candidate)
+                except (ValueError, TypeError, IndexError):
+                    pass
+
+            var_to_bone[var_name] = {
+                'name': bone_name, 'pivot': pivot, 'rotation': rotation, 'cubes': cubes,
+            }
+            var_to_parent_var[var_name] = parent_var
+
+        # Calculate absolute pivots with cycle detection
+        def _abs_pivot(var: str, depth: int = 0, visited: set = None) -> List[float]:
+            if visited is None:
+                visited = set()
+            if var in visited:
+                return [0.0, 0.0, 0.0]  # Cycle detected
+            if depth > 8 or var not in var_to_parent_var:
+                return var_to_bone.get(var, {}).get('pivot', [0.0, 0.0, 0.0])
+
+            visited.add(var)
+            p = var_to_parent_var[var]
+            if p == root_var:
+                visited.remove(var)
+                return var_to_bone[var]['pivot']
+
+            parent_abs = _abs_pivot(p, depth + 1, visited)
+            child_rel = var_to_bone[var]['pivot']
+            visited.remove(var)
+            return [parent_abs[k] + child_rel[k] for k in range(3)]
+
+        # Build GeckoLib bones
+        gecko_bones = []
+        for var, bone in var_to_bone.items():
+            if bone['name'] == '__root__':
+                continue
+
+            abs_piv = _abs_pivot(var)
+            fixed_cubes = []
+            for cube in bone['cubes']:
+                rel = [cube['origin'][k] - bone['pivot'][k] for k in range(3)]
+                fixed_cubes.append({
+                    "origin": [round(abs_piv[k] + rel[k], 4) for k in range(3)],
+                    "size":   cube['size'],
+                    "uv":     cube['uv'],
+                })
+
+            b: dict = {"name": bone['name'], "pivot": [round(x, 4) for x in abs_piv]}
+            if any(r != 0.0 for r in bone['rotation']):
+                b["rotation"] = [round(r, 4) for r in bone['rotation']]
+            pv2 = var_to_parent_var.get(var)
+            if pv2 and pv2 != root_var and pv2 in var_to_bone:
+                pbn = var_to_bone[pv2]['name']
+                if pbn != '__root__':
+                    b["parent"] = pbn
+            if fixed_cubes:
+                b["cubes"] = fixed_cubes
+            gecko_bones.append(b)
+
+        if not gecko_bones:
+            return None
+
+        geo_id = (
+            f"geometry.{sanitize_identifier(namespace)}"
+            f".{sanitize_identifier(entity_name or model_name)}"
         )
+        return {
+            "format_version": "1.12.0",
+            "minecraft:geometry": [{
+                "description": {
+                    "identifier":            geo_id,
+                    "texture_width":         tex_w,
+                    "texture_height":        tex_h,
+                    "visible_bounds_width":  2,
+                    "visible_bounds_height": 2,
+                    "visible_bounds_offset": [0, 1, 0],
+                },
+                "bones": gecko_bones,
+            }],
+        }
+
+    except Exception as e:
+        print(f"[model-convert] Failed to convert LayerDefinition model '{model_name}': {str(e)}")
+        return None
         if pose_m:
             for idx, grp in enumerate(pose_m.groups()):
                 v = _parse_java_float(grp.strip())
@@ -1337,6 +1587,14 @@ def try_convert_model_from_jar(jar, file_path: str, resource_pack: str) -> bool:
     model_name = sanitize_identifier(os.path.splitext(os.path.basename(file_path))[0])
     try:
         geckolib_data = convert_vanilla_model_to_geckolib(data, model_name)
+
+        # Validate the result
+        validation_issues = validate_geckolib_geometry(geckolib_data, model_name)
+        if validation_issues:
+            print(f"[model-convert] ⚠  Validation warnings for {model_name}:")
+            for warning in validation_issues[:3]:  # Limit logging
+                print(f"      • {warning}")
+
     except Exception as e:
         print(f"[model-convert] Failed to convert {file_path}: {e}")
         return False
@@ -1344,7 +1602,12 @@ def try_convert_model_from_jar(jar, file_path: str, resource_pack: str) -> bool:
     out_path = os.path.join(resource_pack, "geometry", f"{model_name}.geo.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     safe_write_json(out_path, geckolib_data)
-    print(f"[model-convert] Converted vanilla model -> GeckoLib: {file_path} -> {out_path}")
+
+    status_msg = f"[model-convert] Converted vanilla model -> GeckoLib: {file_path} -> {out_path}"
+    if 'validation_issues' in locals() and validation_issues:
+        status_msg += f" ⚠ ({len(validation_issues)} warnings)"
+    print(status_msg)
+
     return True
 
 
@@ -1378,272 +1641,300 @@ def convert_modelbase_to_geckolib(
 
     Returns None if no recognisable constructor-style model content is found.
     """
+    try:
+        if not isinstance(java_code, str) or not java_code.strip():
+            return None
 
-    # ── Quick-reject: must look like a constructor-built model ────────────────
-    # At minimum we need setRotationPoint OR addBox plus addChild or addBox calls
-    if 'setRotationPoint' not in java_code and 'addBox' not in java_code:
-        return None
-    # Must not be a pure LayerDefinition file (handled by convert_layerdefinition_to_geckolib)
-    if 'addOrReplaceChild' in java_code and 'setRotationPoint' not in java_code:
-        return None
+        # ── Quick-reject: must look like a constructor-built model ────────────────
+        # At minimum we need setRotationPoint OR addBox plus addChild or addBox calls
+        if 'setRotationPoint' not in java_code and 'addBox' not in java_code:
+            return None
+        # Must not be a pure LayerDefinition file (handled by convert_layerdefinition_to_geckolib)
+        if 'addOrReplaceChild' in java_code and 'setRotationPoint' not in java_code:
+            return None
 
-    # ── 1. Texture dimensions ─────────────────────────────────────────────────
-    tex_w, tex_h = 64, 64
-    for pat in [
-        r'this\.texWidth\s*=\s*(\d+)',
-        r'textureWidth\s*=\s*(\d+)',
-        r'this\.xTexSize\s*=\s*(\d+)',
-    ]:
-        m = re.search(pat, java_code)
-        if m:
-            tex_w = int(m.group(1))
-            break
-    for pat in [
-        r'this\.texHeight\s*=\s*(\d+)',
-        r'textureHeight\s*=\s*(\d+)',
-        r'this\.yTexSize\s*=\s*(\d+)',
-    ]:
-        m = re.search(pat, java_code)
-        if m:
-            tex_h = int(m.group(1))
-            break
+        # ── 1. Texture dimensions ─────────────────────────────────────────────────
+        tex_w, tex_h = 64, 64
+        for pat in [
+            r'this\.texWidth\s*=\s*(\d+)',
+            r'textureWidth\s*=\s*(\d+)',
+            r'this\.xTexSize\s*=\s*(\d+)',
+        ]:
+            m = re.search(pat, java_code)
+            if m:
+                try:
+                    tex_w = int(m.group(1))
+                except (ValueError, IndexError):
+                    pass
+                break
+        for pat in [
+            r'this\.texHeight\s*=\s*(\d+)',
+            r'textureHeight\s*=\s*(\d+)',
+            r'this\.yTexSize\s*=\s*(\d+)',
+        ]:
+            m = re.search(pat, java_code)
+            if m:
+                try:
+                    tex_h = int(m.group(1))
+                except (ValueError, IndexError):
+                    pass
+                break
 
-    # ── 2. Find the constructor (or init method) body ─────────────────────────
-    # Try the class constructor first, then any method named init / registerParts
-    ctor_body = None
-    cls_name_for_ctor = extract_class_name(java_code)
-    if cls_name_for_ctor:
-        ctor_body = _extract_method_body(java_code, [cls_name_for_ctor])
-    if not ctor_body:
-        ctor_body = _extract_method_body(java_code,
-            ['init', 'registerParts', 'buildModel', 'setupModel', 'defineModel'])
-    if not ctor_body:
-        # Fall back to the whole file — messy but better than nothing
-        ctor_body = java_code
+        # ── 2. Find the constructor (or init method) body ─────────────────────────
+        # Try the class constructor first, then any method named init / registerParts
+        ctor_body = None
+        cls_name_for_ctor = extract_class_name(java_code)
+        if cls_name_for_ctor:
+            ctor_body = _extract_method_body(java_code, [cls_name_for_ctor])
+        if not ctor_body:
+            ctor_body = _extract_method_body(java_code,
+                ['init', 'registerParts', 'buildModel', 'setupModel', 'defineModel'])
+        if not ctor_body:
+            # Fall back to the whole file — messy but better than nothing
+            ctor_body = java_code
 
-    # ── 3. Build var→bone-name map from box declarations ─────────────────────
-    # Patterns:
-    #   this.body = new AdvancedModelBox(this, "body")
-    #   this.head = new ModelRenderer(this)
-    #   ModelRenderer head = new ModelRenderer(this)
-    var_to_name: Dict[str, str] = {}
+        # ── 3. Build var→bone-name map from box declarations ─────────────────────
+        # Patterns:
+        #   this.body = new AdvancedModelBox(this, "body")
+        #   this.head = new ModelRenderer(this)
+        #   ModelRenderer head = new ModelRenderer(this)
+        var_to_name: Dict[str, str] = {}
 
-    # AdvancedModelBox / similar with explicit string name
-    for m in re.finditer(
-        r'(?:this\.)?(\w+)\s*=\s*new\s+(?:AdvancedModelBox|ExtendedModelRenderer'
-        r'|ModelBoxRenderer|CubeRenderer|AModelRenderer)\s*\([^,)]*,\s*["\']([^"\']+)["\']',
-        ctor_body
-    ):
-        var_to_name[m.group(1)] = m.group(2)
-
-    # ModelRenderer(this) or ModelRenderer(this, u, v) — use variable name as bone name
-    for m in re.finditer(
-        r'(?:this\.)?(\w+)\s*=\s*new\s+(?:ModelRenderer|ModelPart)\s*\(',
-        ctor_body
-    ):
-        vname = m.group(1)
-        if vname not in var_to_name:
-            var_to_name[vname] = vname  # variable name becomes bone name
-
-    # Also pick up any field that was declared but assigned elsewhere:
-    # new AdvancedModelBox(this, "boneName")  (no leading assignment captured above)
-    for m in re.finditer(
-        r'new\s+(?:AdvancedModelBox|ModelRenderer)\s*\(\s*this\s*,\s*["\']([^"\']+)["\']',
-        ctor_body
-    ):
-        # try to find which variable this was assigned to
-        # look backwards for `this.X =` or `X =` in a small window
-        window = ctor_body[max(0, m.start()-80):m.start()]
-        am = re.search(r'(?:this\.)?(\w+)\s*=\s*$', window.rstrip())
-        if am:
-            var_to_name[am.group(1)] = m.group(1)
-
-    if not var_to_name:
-        return None
-
-    # ── 4. Per-variable: pivot, UV, rotation, cubes ───────────────────────────
-    var_pivot:    Dict[str, List[float]] = {}
-    var_rotation: Dict[str, List[float]] = {}
-    var_cubes:    Dict[str, list]        = {}
-    var_parent:   Dict[str, str]         = {}
-
-    for var in var_to_name:
-        # setRotationPoint
-        pat_rp = (
-            rf'(?:this\.)?{re.escape(var)}\.setRotationPoint\s*\('
-            rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
-        )
-        m = re.search(pat_rp, ctor_body)
-        if m:
-            var_pivot[var] = [
-                _pjf(m.group(1)), _pjf(m.group(2)), _pjf(m.group(3))
-            ]
-        else:
-            var_pivot[var] = [0.0, 0.0, 0.0]
-
-        # Rotations —————————————————————————————————————————————————
-        rx, ry, rz = 0.0, 0.0, 0.0
-
-        # setRotationAngle(this.var, x, y, z) helper call (radians)
-        pat_sra = (
-            rf'setRotationAngle\s*\(\s*(?:this\.)?{re.escape(var)}'
-            rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
-        )
-        m = re.search(pat_sra, ctor_body)
-        if m:
-            rx = math.degrees(_pjf(m.group(1)))
-            ry = math.degrees(_pjf(m.group(2)))
-            rz = math.degrees(_pjf(m.group(3)))
-        else:
-            # Direct field assignments: this.var.rotateAngleX = -1.5707F;
-            for axis, idx in (('X', 0), ('Y', 1), ('Z', 2)):
-                pat_ax = (
-                    rf'(?:this\.)?{re.escape(var)}\.rotateAngle{axis}\s*=\s*({_FLOAT_EXPR_RE})'
-                )
-                am = re.search(pat_ax, ctor_body)
-                if am:
-                    deg = _eval_rot_expr(am.group(1))
-                    if deg is not None:
-                        if idx == 0: rx = deg
-                        elif idx == 1: ry = deg
-                        else: rz = deg
-
-        var_rotation[var] = [round(rx, 4), round(ry, 4), round(rz, 4)]
-
-        # Cubes ——————————————————————————————————————————————————————
-        cubes: list = []
-        cur_u, cur_v = 0, 0
-
-        # setTextureOffset(u, v) OR texOffset(u, v) followed immediately by .addBox(...)
-        # Scan all occurrences on this variable
-        uv_pats = [
-            rf'(?:this\.)?{re.escape(var)}\.setTextureOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
-            rf'(?:this\.)?{re.escape(var)}\.texOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
-        ]
-        for uv_pat in uv_pats:
-            for uvm in re.finditer(uv_pat, ctor_body):
-                cur_u = int(uvm.group(1))
-                cur_v = int(uvm.group(2))
-                # Find the addBox call that follows on the same chain or same statement
-                after = ctor_body[uvm.end():uvm.end() + 300]
-                ab = re.match(
-                    r'\s*(?:\.\s*)?addBox\s*\('
-                    rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
-                    rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
-                    after
-                )
-                if ab:
-                    try:
-                        ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
-                        sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
-                        pivot = var_pivot.get(var, [0., 0., 0.])
-                        cubes.append({
-                            "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
-                            "size":   [sx, sy, sz],
-                            "uv":     [cur_u, cur_v],
-                        })
-                    except (ValueError, TypeError):
-                        pass
-
-        # Bare addBox calls directly on the variable (no preceding texOffset)
-        for ab in re.finditer(
-            rf'(?:this\.)?{re.escape(var)}\.addBox\s*\('
-            rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
-            rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
+        # AdvancedModelBox / similar with explicit string name
+        for m in re.finditer(
+            r'(?:this\.)?(\w+)\s*=\s*new\s+(?:AdvancedModelBox|ExtendedModelRenderer'
+            r'|ModelBoxRenderer|CubeRenderer|AModelRenderer)\s*\([^,)]*,\s*["\']([^"\']+)["\']',
             ctor_body
         ):
-            try:
-                ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
-                sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
-                pivot = var_pivot.get(var, [0., 0., 0.])
-                candidate = {
-                    "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
-                    "size":   [sx, sy, sz],
-                    "uv":     [cur_u, cur_v],
-                }
-                if candidate not in cubes:
-                    cubes.append(candidate)
-            except (ValueError, TypeError):
-                pass
+            var_to_name[m.group(1)] = m.group(2)
 
-        var_cubes[var] = cubes
+        # ModelRenderer(this) or ModelRenderer(this, u, v) — use variable name as bone name
+        for m in re.finditer(
+            r'(?:this\.)?(\w+)\s*=\s*new\s+(?:ModelRenderer|ModelPart)\s*\(',
+            ctor_body
+        ):
+            vname = m.group(1)
+            if vname not in var_to_name:
+                var_to_name[vname] = vname  # variable name becomes bone name
 
-    # ── 5. Parent-child wiring from addChild calls ────────────────────────────
-    for m in re.finditer(
-        r'(?:this\.)?(\w+)\.addChild\s*\(\s*(?:this\.)?(\w+)\s*\)',
-        ctor_body
-    ):
-        parent_var = m.group(1)
-        child_var  = m.group(2)
-        if child_var in var_to_name and parent_var in var_to_name:
-            var_parent[child_var] = parent_var
+        # Also pick up any field that was declared but assigned elsewhere:
+        # new AdvancedModelBox(this, "boneName")  (no leading assignment captured above)
+        for m in re.finditer(
+            r'new\s+(?:AdvancedModelBox|ModelRenderer)\s*\(\s*this\s*,\s*["\']([^"\']+)["\']',
+            ctor_body
+        ):
+            # try to find which variable this was assigned to
+            # look backwards for `this.X =` or `X =` in a small window
+            window = ctor_body[max(0, m.start()-80):m.start()]
+            am = re.search(r'(?:this\.)?(\w+)\s*=\s*$', window.rstrip())
+            if am:
+                var_to_name[am.group(1)] = m.group(1)
 
-    # Identify root bones (no parent, or parented to 'root' / themselves)
-    all_children = set(var_parent.keys())
+        if not var_to_name:
+            return None
 
-    # ── 6. Compute absolute pivots ────────────────────────────────────────────
-    def _abs_piv(var: str, depth: int = 0) -> List[float]:
-        if depth > 10:
-            return var_pivot.get(var, [0., 0., 0.])
-        p = var_parent.get(var)
-        if p is None or p == var:
-            return var_pivot.get(var, [0., 0., 0.])
-        parent_abs = _abs_piv(p, depth + 1)
-        rel        = var_pivot.get(var, [0., 0., 0.])
-        return [parent_abs[i] + rel[i] for i in range(3)]
+        # ── 4. Per-variable: pivot, UV, rotation, cubes ───────────────────────────
+        var_pivot:    Dict[str, List[float]] = {}
+        var_rotation: Dict[str, List[float]] = {}
+        var_cubes:    Dict[str, list]        = {}
+        var_parent:   Dict[str, str]         = {}
 
-    # ── 7. Build GeckoLib bones ───────────────────────────────────────────────
-    gecko_bones = []
-    for var, bone_name in var_to_name.items():
-        abs_piv = _abs_piv(var)
-        pivot   = var_pivot.get(var, [0., 0., 0.])
+        for var in var_to_name:
+            # setRotationPoint with validation
+            pat_rp = (
+                rf'(?:this\.)?{re.escape(var)}\.setRotationPoint\s*\('
+                rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
+            )
+            m = re.search(pat_rp, ctor_body)
+            if m:
+                try:
+                    var_pivot[var] = [
+                        _pjf(m.group(1)), _pjf(m.group(2)), _pjf(m.group(3))
+                    ]
+                except (ValueError, TypeError, IndexError):
+                    var_pivot[var] = [0.0, 0.0, 0.0]
+            else:
+                var_pivot[var] = [0.0, 0.0, 0.0]
 
-        # Fix cube origins to be absolute
-        fixed_cubes = []
-        for cube in var_cubes.get(var, []):
-            # cube origin was stored as pivot+local — subtract pivot, add abs_piv
-            rel = [cube['origin'][i] - pivot[i] for i in range(3)]
-            fixed_cubes.append({
-                "origin": [round(abs_piv[i] + rel[i], 4) for i in range(3)],
-                "size":   cube['size'],
-                "uv":     cube['uv'],
-            })
+            # Rotations —————————————————————————————————————————————————
+            rx, ry, rz = 0.0, 0.0, 0.0
 
-        b: dict = {
-            "name":  bone_name,
-            "pivot": [round(x, 4) for x in abs_piv],
+            # setRotationAngle(this.var, x, y, z) helper call (radians)
+            pat_sra = (
+                rf'setRotationAngle\s*\(\s*(?:this\.)?{re.escape(var)}'
+                rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*\)'
+            )
+            m = re.search(pat_sra, ctor_body)
+            if m:
+                try:
+                    rx = math.degrees(_pjf(m.group(1)))
+                    ry = math.degrees(_pjf(m.group(2)))
+                    rz = math.degrees(_pjf(m.group(3)))
+                except (ValueError, TypeError, IndexError):
+                    pass
+            else:
+                # Direct field assignments: this.var.rotateAngleX = -1.5707F;
+                for axis, idx in (('X', 0), ('Y', 1), ('Z', 2)):
+                    pat_ax = (
+                        rf'(?:this\.)?{re.escape(var)}\.rotateAngle{axis}\s*=\s*({_FLOAT_EXPR_RE})'
+                    )
+                    am = re.search(pat_ax, ctor_body)
+                    if am:
+                        deg = _eval_rot_expr(am.group(1))
+                        if deg is not None:
+                            if idx == 0: rx = deg
+                            elif idx == 1: ry = deg
+                            else: rz = deg
+
+            var_rotation[var] = [round(rx, 4), round(ry, 4), round(rz, 4)]
+
+            # Cubes ——————————————————————————————————————————————————————
+            cubes: list = []
+            cur_u, cur_v = 0, 0
+
+            # setTextureOffset(u, v) OR texOffset(u, v) followed immediately by .addBox(...)
+            # Scan all occurrences on this variable
+            uv_pats = [
+                rf'(?:this\.)?{re.escape(var)}\.setTextureOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
+                rf'(?:this\.)?{re.escape(var)}\.texOffset\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
+            ]
+            for uv_pat in uv_pats:
+                for uvm in re.finditer(uv_pat, ctor_body):
+                    try:
+                        cur_u = int(uvm.group(1))
+                        cur_v = int(uvm.group(2))
+                    except (ValueError, IndexError):
+                        continue
+
+                    # Find the addBox call that follows on the same chain or same statement
+                    after = ctor_body[uvm.end():uvm.end() + 300]
+                    ab = re.match(
+                        r'\s*(?:\.\s*)?addBox\s*\('
+                        rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
+                        rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
+                        after
+                    )
+                    if ab:
+                        try:
+                            ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
+                            sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
+                            pivot = var_pivot.get(var, [0., 0., 0.])
+                            cubes.append({
+                                "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
+                                "size":   [sx, sy, sz],
+                                "uv":     [cur_u, cur_v],
+                            })
+                        except (ValueError, TypeError, IndexError):
+                            pass
+
+            # Bare addBox calls directly on the variable (no preceding texOffset)
+            for ab in re.finditer(
+                rf'(?:this\.)?{re.escape(var)}\.addBox\s*\('
+                rf'\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})'
+                rf'\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})\s*,\s*({_FLOAT_RE})',
+                ctor_body
+            ):
+                try:
+                    ox, oy, oz = _pjf(ab.group(1)), _pjf(ab.group(2)), _pjf(ab.group(3))
+                    sx, sy, sz = _pjf(ab.group(4)), _pjf(ab.group(5)), _pjf(ab.group(6))
+                    pivot = var_pivot.get(var, [0., 0., 0.])
+                    candidate = {
+                        "origin": [round(pivot[0]+ox, 4), round(pivot[1]+oy, 4), round(pivot[2]+oz, 4)],
+                        "size":   [sx, sy, sz],
+                        "uv":     [cur_u, cur_v],
+                    }
+                    if candidate not in cubes:
+                        cubes.append(candidate)
+                except (ValueError, TypeError, IndexError):
+                    pass
+
+            var_cubes[var] = cubes
+
+        # ── 5. Parent-child wiring from addChild calls ────────────────────────────
+        for m in re.finditer(
+            r'(?:this\.)?(\w+)\.addChild\s*\(\s*(?:this\.)?(\w+)\s*\)',
+            ctor_body
+        ):
+            parent_var = m.group(1)
+            child_var  = m.group(2)
+            if child_var in var_to_name and parent_var in var_to_name:
+                var_parent[child_var] = parent_var
+
+        # Identify root bones (no parent, or parented to 'root' / themselves)
+        all_children = set(var_parent.keys())
+
+        # ── 6. Compute absolute pivots ────────────────────────────────────────────
+        def _abs_piv(var: str, depth: int = 0, visited: set = None) -> List[float]:
+            if visited is None:
+                visited = set()
+            if var in visited or depth > 10:
+                return var_pivot.get(var, [0., 0., 0.])
+            visited.add(var)
+            p = var_parent.get(var)
+            if p is None or p == var or p not in var_to_name:
+                visited.remove(var)
+                return var_pivot.get(var, [0., 0., 0.])
+            parent_abs = _abs_piv(p, depth + 1, visited)
+            rel        = var_pivot.get(var, [0., 0., 0.])
+            visited.remove(var)
+            return [parent_abs[i] + rel[i] for i in range(3)]
+
+        # ── 7. Build GeckoLib bones ───────────────────────────────────────────────
+        gecko_bones = []
+        for var, bone_name in var_to_name.items():
+            abs_piv = _abs_piv(var)
+            pivot   = var_pivot.get(var, [0., 0., 0.])
+
+            # Fix cube origins to be absolute
+            fixed_cubes = []
+            for cube in var_cubes.get(var, []):
+                # cube origin was stored as pivot+local — subtract pivot, add abs_piv
+                rel = [cube['origin'][i] - pivot[i] for i in range(3)]
+                fixed_cubes.append({
+                    "origin": [round(abs_piv[i] + rel[i], 4) for i in range(3)],
+                    "size":   cube['size'],
+                    "uv":     cube['uv'],
+                })
+
+            b: dict = {
+                "name":  bone_name,
+                "pivot": [round(x, 4) for x in abs_piv],
+            }
+            rot = var_rotation.get(var, [0., 0., 0.])
+            if any(r != 0. for r in rot):
+                b["rotation"] = rot
+            p_var = var_parent.get(var)
+            if p_var and p_var in var_to_name:
+                b["parent"] = var_to_name[p_var]
+            if fixed_cubes:
+                b["cubes"] = fixed_cubes
+            gecko_bones.append(b)
+
+        if not gecko_bones:
+            return None
+
+        geo_id = (
+            f"geometry.{sanitize_identifier(namespace)}"
+            f".{sanitize_identifier(entity_name or model_name)}"
+        )
+        return {
+            "format_version": "1.12.0",
+            "minecraft:geometry": [{
+                "description": {
+                    "identifier":            geo_id,
+                    "texture_width":         tex_w,
+                    "texture_height":        tex_h,
+                    "visible_bounds_width":  2,
+                    "visible_bounds_height": 2,
+                    "visible_bounds_offset": [0, 1, 0],
+                },
+                "bones": gecko_bones,
+            }],
         }
-        rot = var_rotation.get(var, [0., 0., 0.])
-        if any(r != 0. for r in rot):
-            b["rotation"] = rot
-        p_var = var_parent.get(var)
-        if p_var and p_var in var_to_name:
-            b["parent"] = var_to_name[p_var]
-        if fixed_cubes:
-            b["cubes"] = fixed_cubes
-        gecko_bones.append(b)
 
-    if not gecko_bones:
+    except Exception as e:
+        print(f"[model-convert] Failed to convert ModelBase model '{model_name}': {str(e)}")
         return None
-
-    geo_id = (
-        f"geometry.{sanitize_identifier(namespace)}"
-        f".{sanitize_identifier(entity_name or model_name)}"
-    )
-    return {
-        "format_version": "1.12.0",
-        "minecraft:geometry": [{
-            "description": {
-                "identifier":            geo_id,
-                "texture_width":         tex_w,
-                "texture_height":        tex_h,
-                "visible_bounds_width":  2,
-                "visible_bounds_height": 2,
-                "visible_bounds_offset": [0, 1, 0],
-            },
-            "bones": gecko_bones,
-        }],
-    }
 
 
 # Float-literal regex helpers used by convert_modelbase_to_geckolib
@@ -1654,6 +1945,129 @@ def _pjf(s: str) -> float:
     """Parse a Java float/double literal to Python float."""
     v = _parse_java_float(str(s).strip())
     return v if v is not None else 0.0
+
+
+def validate_geckolib_geometry(geo_data: dict, model_name: str) -> List[str]:
+    """
+    Validate a GeckoLib geometry JSON for common issues.
+    Returns a list of warning/error messages.
+    """
+    warnings = []
+
+    try:
+        if not isinstance(geo_data, dict):
+            return ["Geometry data is not a dictionary"]
+
+        if "minecraft:geometry" not in geo_data:
+            return ["Missing 'minecraft:geometry' key"]
+
+        geometries = geo_data.get("minecraft:geometry", [])
+        if not isinstance(geometries, list) or not geometries:
+            return ["'minecraft:geometry' is not a non-empty list"]
+
+        geometry = geometries[0]
+        if not isinstance(geometry, dict):
+            return ["First geometry entry is not a dictionary"]
+
+        # Check description
+        desc = geometry.get("description", {})
+        if not isinstance(desc, dict):
+            warnings.append("Geometry description is not a dictionary")
+        else:
+            required_desc_fields = ["identifier", "texture_width", "texture_height"]
+            for field in required_desc_fields:
+                if field not in desc:
+                    warnings.append(f"Missing required description field: {field}")
+                elif not isinstance(desc[field], (str, int)):
+                    warnings.append(f"Description field '{field}' has invalid type")
+
+        # Check bones
+        bones = geometry.get("bones", [])
+        if not isinstance(bones, list):
+            return ["'bones' is not a list"]
+
+        if not bones:
+            warnings.append("No bones found in geometry")
+
+        bone_names = set()
+        for i, bone in enumerate(bones):
+            if not isinstance(bone, dict):
+                warnings.append(f"Bone {i} is not a dictionary")
+                continue
+
+            # Check required fields
+            if "name" not in bone:
+                warnings.append(f"Bone {i} missing 'name' field")
+            else:
+                name = bone["name"]
+                if not isinstance(name, str):
+                    warnings.append(f"Bone {i} 'name' is not a string")
+                elif name in bone_names:
+                    warnings.append(f"Duplicate bone name: {name}")
+                else:
+                    bone_names.add(name)
+
+            if "pivot" not in bone:
+                warnings.append(f"Bone '{bone.get('name', i)}' missing 'pivot' field")
+            else:
+                pivot = bone["pivot"]
+                if not isinstance(pivot, list) or len(pivot) != 3:
+                    warnings.append(f"Bone '{bone.get('name', i)}' 'pivot' is not a 3-element list")
+                else:
+                    for j, coord in enumerate(pivot):
+                        if not isinstance(coord, (int, float)):
+                            warnings.append(f"Bone '{bone.get('name', i)}' pivot[{j}] is not numeric")
+
+            # Check cubes
+            cubes = bone.get("cubes", [])
+            if not isinstance(cubes, list):
+                warnings.append(f"Bone '{bone.get('name', i)}' 'cubes' is not a list")
+            else:
+                for j, cube in enumerate(cubes):
+                    if not isinstance(cube, dict):
+                        warnings.append(f"Bone '{bone.get('name', i)}' cube {j} is not a dictionary")
+                        continue
+
+                    for field in ["origin", "size", "uv"]:
+                        if field not in cube:
+                            warnings.append(f"Bone '{bone.get('name', i)}' cube {j} missing '{field}' field")
+                        elif not isinstance(cube[field], list) or len(cube[field]) != (3 if field != "uv" else 2):
+                            warnings.append(f"Bone '{bone.get('name', i)}' cube {j} '{field}' has wrong format")
+
+            # Check parent references
+            parent = bone.get("parent")
+            if parent is not None:
+                if not isinstance(parent, str):
+                    warnings.append(f"Bone '{bone.get('name', i)}' 'parent' is not a string")
+                elif parent not in bone_names and parent != "__root__":
+                    warnings.append(f"Bone '{bone.get('name', i)}' references unknown parent '{parent}'")
+
+    except Exception as e:
+        return [f"Validation failed with exception: {str(e)}"]
+
+    return warnings
+
+
+def safe_write_json(out_path: str, data: dict) -> None:
+    """Write JSON data to file with validation and error handling."""
+    try:
+        # Validate the data first
+        model_name = os.path.splitext(os.path.basename(out_path))[0]
+        warnings = validate_geckolib_geometry(data, model_name)
+
+        if warnings:
+            print(f"[model-convert] ⚠  Validation warnings for {out_path}:")
+            for warning in warnings[:5]:  # Limit to first 5 warnings
+                print(f"      • {warning}")
+            if len(warnings) > 5:
+                print(f"      • ... and {len(warnings) - 5} more warnings")
+
+        # Write the file
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        raise IOError(f"Failed to write JSON to {out_path}: {str(e)}") from e
 
 
 def scan_and_convert_layerdefinition_models(
@@ -1744,14 +2158,25 @@ def scan_and_convert_layerdefinition_models(
         # Try LayerDefinition converter first, then constructor-style converter
         geo_data: Optional[dict] = None
         method_used = ''
+        conversion_warnings = []
+
         if is_layerdef:
             geo_data = convert_layerdefinition_to_geckolib(code, cls_name, namespace)
             if geo_data:
                 method_used = 'layerdef'
+                # Validate the result
+                validation_issues = validate_geckolib_geometry(geo_data, cls_name)
+                if validation_issues:
+                    conversion_warnings.extend(validation_issues)
+
         if geo_data is None and is_ctor_model:
             geo_data = convert_modelbase_to_geckolib(code, cls_name, namespace)
             if geo_data:
                 method_used = 'modelbase'
+                # Validate the result
+                validation_issues = validate_geckolib_geometry(geo_data, cls_name)
+                if validation_issues:
+                    conversion_warnings.extend(validation_issues)
 
         if geo_data is None:
             continue
@@ -1762,7 +2187,17 @@ def scan_and_convert_layerdefinition_models(
             geo_id = geo_data['minecraft:geometry'][0]['description']['identifier']
             result[cls_name] = geo_id
             converted += 1
-            print(f"[{method_used}] Converted {cls_name} -> {model_stem}.geo.json  ({geo_id})")
+
+            status_msg = f"[{method_used}] Converted {cls_name} -> {model_stem}.geo.json  ({geo_id})"
+            if conversion_warnings:
+                status_msg += f" ⚠ ({len(conversion_warnings)} warnings)"
+            print(status_msg)
+
+            # Log warnings if any
+            if conversion_warnings:
+                for warning in conversion_warnings[:3]:  # Limit logging
+                    print(f"      • {warning}")
+
         except Exception as e:
             print(f"[model-convert] Failed to write {out_path}: {e}")
 
@@ -8657,6 +9092,19 @@ def run_pipeline():
 
     shutil.make_archive("Bedrock_Pack", "zip", "Bedrock_Pack")
     shutil.move("Bedrock_Pack.zip", "Bedrock_Pack.mcaddon")
+
+# Get the current working directory
+    current_dir = os.getcwd()
+    
+    # Iterate through all items in the directory
+    for item in os.listdir(current_dir):
+        # Check if the item is a directory and starts with 'src'
+        if os.path.isdir(item) and item.startswith("src"):
+            try:
+                print(f"Deleting: {item}")
+                shutil.rmtree(item)
+            except Exception as e:
+                print(f"Failed to delete {item}: {e}")
 
 if __name__ == "__main__":
     run_pipeline()

@@ -34,7 +34,7 @@ ModMorpher only works with mods built using **MCreator** on **Forge or NeoForge*
 1. Place the compiled Java `.jar` file into the project root directory.
 2. Execute the pipeline manager via the terminal:
    ```bash
-   python pipeline_manager.py
+   python modmorpher.py
 3. Zip up the Bedrock_pack folder as a .mcaddon file
 4.  **ENJOY!**
 

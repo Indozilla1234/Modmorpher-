@@ -20,11 +20,11 @@ ModMorpher only works with mods built using **MCreator** on **Forge or NeoForge*
 
 | Minecraft Version | Loader | Support Level |
 |---|---|---|
-| 1.20.1+ | NeoForge | ✅ Decent at best, may need manual fixes|
-| 1.18+ | Forge | ⭐ Best |
-| 1.12+ | Forge | ⚠️ **WILL** need manual fixes |
-| 1.3+ | Forge | ❌ Not recommended |
-| Any Version | Fabric/Quilt | ❌ **NOT SUPPORTED**
+| 1.20.1+ | NeoForge |  Decent at best, may need manual fixes|
+| 1.18+ | Forge |  Best |
+| 1.12+ | Forge |  **WILL** need manual fixes |
+| 1.3+ | Forge |  Not recommended |
+| Any Version | Fabric/Quilt |  **NOT SUPPORTED**
   
 ### Prerequisites
 * **Python 3.10+** (System Path)
@@ -51,7 +51,7 @@ This toolkit is a bridge for creators, not a vehicle for piracy.
 ModMorpher is designed to make cross‑platform modding fun, safe, and respectful.  
 Because this toolkit touches both **Java Edition** and **Bedrock Edition** ecosystems, the license is intentionally structured to protect creators, communities, and the project itself.
 
-### 🛡️ Protecting Java Creators  
+###  Protecting Java Creators  
 Java mods are often open‑source, but they are also frequently stolen, reposted, or sold without permission.  
 ModMorpher’s license ensures that:
 
@@ -61,7 +61,7 @@ ModMorpher’s license ensures that:
 
 This keeps Java creators safe while still allowing players to enjoy their favorite mods with friends.
 
-### 🧱 Protecting Bedrock Creators  
+###  Protecting Bedrock Creators  
 The Bedrock ecosystem includes DRM, Marketplace rules, and paid content.  
 To avoid misuse and protect Bedrock creators:
 
@@ -71,7 +71,7 @@ To avoid misuse and protect Bedrock creators:
 
 This ensures the tool is never used to harm Bedrock creators or violate Microsoft’s policies.
 
-### 🔧 Protecting Mod Loaders and Communities  
+###  Protecting Mod Loaders and Communities  
 Java loaders like Forge, Fabric, Quilt, and NeoForge rely on clear licensing and community trust.  
 ModMorpher respects their rules by:
 
@@ -81,7 +81,7 @@ ModMorpher respects their rules by:
 
 This prevents fragmentation or misuse that could harm the broader modding ecosystem.
 
-### 👥 Protecting Players and Developers  
+###  Protecting Players and Developers  
 Most importantly, the license keeps ModMorpher fun and safe to use:
 
 - You can convert **your own mods**  
@@ -92,7 +92,7 @@ Most importantly, the license keeps ModMorpher fun and safe to use:
 
 The goal is to support creativity — not punish it.
 
-### 🚀 Built for Fun, Not Abuse  
+###  Built for Fun, Not Abuse  
 ModMorpher exists to help players enjoy the mods they love, not to enable piracy or harm creators.  
 The license ensures the project stays alive, legal, and respectful of everyone’s work.
 

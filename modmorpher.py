@@ -1,4 +1,4 @@
-Tool_Version = 1.2.4.3
+Tool_Version = "1.3"
 
 import os
 import re
@@ -120,11 +120,17 @@ try:
 except Exception:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow"])
     PIL_AVAILABLE = True
+JAVALANG_AVAILABLE = False
 try:
     import javalang
+    JAVALANG_AVAILABLE = True
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "javalang"])
-JAVALANG_AVAILABLE = True
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "javalang"])
+        import javalang
+        JAVALANG_AVAILABLE = True
+    except Exception:
+        JAVALANG_AVAILABLE = False
 class JavaAST:
     def __init__(self, source: str):
         self._src = source
@@ -409,8 +415,41 @@ def create_manifest(pack_name: str, pack_type: str):
 def write_manifest_for(folder: str, pack_name: str, pack_type: str):
     path = os.path.join(folder, "manifest.json")
     os.makedirs(folder, exist_ok=True)
+    manifest = create_manifest(pack_name, pack_type)
+    if pack_type == "BP":
+        scripts_dir = os.path.join(folder, "scripts")
+        if os.path.isdir(scripts_dir) and any(f.endswith(".js") for f in os.listdir(scripts_dir)):
+            manifest["modules"] = [
+                {
+                    "type": "data",
+                    "uuid": str(uuid.uuid4()),
+                    "version": [1, 0, 0]
+                },
+                {
+                    "type": "script",
+                    "uuid": str(uuid.uuid4()),
+                    "version": [1, 0, 0],
+                    "language": "javascript",
+                    "entry": "scripts/main.js"
+                }
+            ]
+            entry_scripts = [
+                f for f in os.listdir(scripts_dir)
+                if f.endswith(".js") and f != "main.js"
+            ]
+            main_js = os.path.join(scripts_dir, "main.js")
+            if entry_scripts and not os.path.exists(main_js):
+                imports = "\n".join(f'import "./{f}";' for f in sorted(entry_scripts))
+                with open(main_js, "w", encoding="utf-8") as mf:
+                    mf.write(imports + "\n")
+            manifest["dependencies"] = [
+                {
+                    "module_name": "@minecraft/server",
+                    "version": "1.13.0"
+                }
+            ]
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(create_manifest(pack_name, pack_type), f, indent=4)
+        json.dump(manifest, f, indent=4)
 def sanitize_identifier(name: Optional[str]) -> str:
     if not name:
         return ""
@@ -5114,10 +5153,832 @@ def convert_java_block_full(java_code: str, java_path: str, namespace: str):
         doc["minecraft:block"]["description"]["states"] = {f"{namespace}:{k}": v for k, v in states.items()}
     if permutations:
         doc["minecraft:block"]["permutations"] = permutations
+    generate_block_script(java_code, safe_name, block_id, namespace)
+    _finish_block_json(doc, safe_name)
+_BLOCK_EVENT_METHOD_MAP = {
+    "use":             ("afterEvents", "playerInteractWithBlock", "event.player"),
+    "attack":          ("afterEvents", "playerInteractWithBlock", "event.player"),
+    "stepOn":          ("afterEvents", "entityStepOnBlock",       "event.entity"),
+    "fallOn":          ("afterEvents", "entityFallOnBlock",       "event.entity"),
+    "entityInside":    ("afterEvents", "entityEnterBlock",        "event.entity"),
+    "neighborChanged": ("afterEvents", "playerPlaceBlock",        "event.player"),
+    "onPlace":         ("afterEvents", "playerPlaceBlock",        "event.player"),
+    "onRemove":        ("afterEvents", "playerBreakBlock",        "event.player"),
+    "playerDestroy":   ("afterEvents", "playerBreakBlock",        "event.player"),
+    "randomTick":      ("afterEvents", "entitySpawn",             "event.entity"),
+    "tick":            ("afterEvents", "entitySpawn",             "event.entity"),
+}
+
+def generate_block_script(java_code: str, safe_name: str, block_id: str, namespace: str) -> bool:
+    found_methods = []
+    for method_name, (phase, bedrock_event, entity_ref) in _BLOCK_EVENT_METHOD_MAP.items():
+        body = _extract_method_body(java_code, method_name)
+        if body:
+            found_methods.append((method_name, phase, bedrock_event, entity_ref, body))
+
+    static_handlers = _find_static_event_handlers(java_code)
+
+    if not found_methods and not static_handlers:
+        return False
+
+    needs_permutation = _needs_repair_helper(static_handlers)
+    base_imports = "world, system, GameMode, ItemStack"
+    if needs_permutation:
+        base_imports += ", BlockPermutation"
+    script_lines = [f'import {{ {base_imports} }} from "@minecraft/server";', '']
+
+    for method_name, phase, bedrock_event, entity_ref, body in found_methods:
+        translated = _translate_use_body(body, namespace, safe_name)
+        script_lines += [
+            f'world.{phase}.{bedrock_event}.subscribe((event) => {{',
+            f'    const block = event.block;',
+            f'    if (!block || block.typeId !== "{block_id}") return;',
+            f'    const actor = {entity_ref};',
+            f'    if (!actor) return;',
+        ] + translated + ['});', '']
+
+    for _, event_type, phase, bedrock_event, param, body in static_handlers:
+        if script_lines[-1] != '':
+            script_lines.append('')
+        translated = _translate_handler_body(body, event_type, param, java_code, namespace, safe_name)
+        script_lines += [f'world.{phase}.{bedrock_event}.subscribe(({param}) => {{'] + translated + ['});']
+
+    if _needs_repair_helper(static_handlers):
+        script_lines += [''] + _emit_repair_helper()
+
+    out_path = os.path.join(BP_FOLDER, "scripts", f"block_{safe_name}.js")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(script_lines))
+    print(f"[block-script] Wrote {out_path}")
+    return True
+
+def _finish_block_json(doc: dict, safe_name: str) -> None:
     out_path = os.path.join(BP_FOLDER, "blocks", f"{safe_name}.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     safe_write_json(out_path, doc)
     print(f"[block] Wrote {out_path}")
+_EFFECT_NAME_MAP = {
+    "SPEED": "speed", "SLOWNESS": "slowness", "HASTE": "haste",
+    "MINING_FATIGUE": "mining_fatigue", "STRENGTH": "strength",
+    "INSTANT_HEALTH": "instant_health", "INSTANT_DAMAGE": "instant_damage",
+    "JUMP_BOOST": "jump_boost", "NAUSEA": "nausea", "REGENERATION": "regeneration",
+    "RESISTANCE": "resistance", "FIRE_RESISTANCE": "fire_resistance",
+    "WATER_BREATHING": "water_breathing", "INVISIBILITY": "invisibility",
+    "BLINDNESS": "blindness", "NIGHT_VISION": "night_vision", "HUNGER": "hunger",
+    "WEAKNESS": "weakness", "POISON": "poison", "WITHER": "wither",
+    "HEALTH_BOOST": "health_boost", "ABSORPTION": "absorption",
+    "SATURATION": "saturation", "GLOWING": "glowing", "LEVITATION": "levitation",
+    "LUCK": "luck", "UNLUCK": "unluck", "SLOW_FALLING": "slow_falling",
+    "CONDUIT_POWER": "conduit_power", "DOLPHINS_GRACE": "dolphins_grace",
+    "BAD_OMEN": "bad_omen", "HERO_OF_THE_VILLAGE": "hero_of_the_village",
+    "DARKNESS": "darkness",
+}
+
+_SOUND_NAME_MAP = {
+    "EXPERIENCE_ORB_PICKUP": "random.orb", "ITEM_PICKUP": "random.pop",
+    "ENTITY_PLAYER_LEVELUP": "random.levelup", "ENTITY_PLAYER_HURT": "game.player.hurt",
+    "ENTITY_PLAYER_DEATH": "game.player.die", "BLOCK_GLASS_BREAK": "random.glass",
+    "ENTITY_GENERIC_EXPLODE": "random.explode", "ENTITY_LIGHTNING_BOLT_THUNDER": "ambient.weather.thunder",
+    "ENTITY_ENDER_DRAGON_GROWL": "mob.enderdragon.growl", "BLOCK_ANVIL_USE": "random.anvil_use",
+    "ENTITY_ARROW_SHOOT": "random.bow", "ENTITY_FIREWORK_ROCKET_LAUNCH": "firework.launch",
+}
+
+def _extract_method_body(java_code: str, method_name: str) -> str:
+    pattern = (
+        r'(?:@Override\s+)?(?:public|protected|private)\s+\S+(?:<[^>]+>)?\s+'
+        + re.escape(method_name)
+        + r'\s*\([^)]*\)\s*\{'
+    )
+    m = re.search(pattern, java_code, re.DOTALL)
+    if not m:
+        return ""
+    start = m.end() - 1
+    depth, i = 0, start
+    while i < len(java_code):
+        if java_code[i] == '{':
+            depth += 1
+        elif java_code[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return java_code[start:i + 1]
+        i += 1
+    return ""
+
+def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
+    lines = []
+
+    effect_hits = re.findall(
+        r'new\s+MobEffectInstance\s*\(\s*MobEffects\.(\w+)\s*,\s*(\d+)\s*(?:,\s*(\d+))?',
+        body
+    )
+    for hit in effect_hits:
+        effect_key, duration_ticks, amplifier = hit
+        bedrock_effect = _EFFECT_NAME_MAP.get(effect_key, effect_key.lower())
+        duration_sec = int(duration_ticks) / 20
+        amp = int(amplifier) if amplifier else 0
+        lines.append(f'        player.addEffect("minecraft:{bedrock_effect}", {duration_sec}, {{ amplifier: {amp}, showParticles: true }});')
+
+    sound_hits = re.findall(r'SoundEvents\.(\w+)', body)
+    for hit in sound_hits:
+        bedrock_sound = _SOUND_NAME_MAP.get(hit, "random.pop")
+        lines.append(f'        player.dimension.playSound("{bedrock_sound}", player.location);')
+
+    if re.search(r'player\.heal\s*\(|setHealth\s*\(', body):
+        heal_m = re.search(r'player\.heal\s*\(\s*([0-9.f]+)', body)
+        amount = float(heal_m.group(1).rstrip('f')) if heal_m else 4.0
+        lines.append(f'        const health = player.getComponent("minecraft:health");')
+        lines.append(f'        if (health) health.setCurrentValue(Math.min(health.currentValue + {amount}, health.effectiveMax));')
+
+    entity_hits = re.findall(
+        r'(?:addFreshEntity|summon|spawnEntity)\s*\(\s*new\s+(\w+)\s*\(', body
+    )
+    for hit in entity_hits:
+        entity_id = f"{namespace}:{sanitize_identifier(hit)}"
+        lines.append(f'        player.dimension.spawnEntity("{entity_id}", player.location);')
+
+    if re.search(r'player\.setOnFire\s*\(|setSecondsOnFire\s*\(', body):
+        fire_m = re.search(r'setOnFire\s*\(\s*(\d+)', body) or re.search(r'setSecondsOnFire\s*\(\s*(\d+)', body)
+        seconds = int(fire_m.group(1)) if fire_m else 5
+        lines.append(f'        player.setOnFire({seconds});')
+
+    if re.search(r'player\.teleportTo\s*\(|player\.teleport\s*\(', body):
+        lines.append(f'        // TODO: implement teleport target from original Java logic')
+
+    cooldown_m = re.search(r'addCooldown\s*\(\s*this\s*,\s*(\d+)', body)
+    if cooldown_m:
+        ticks = int(cooldown_m.group(1))
+        lines.append(f'        player.startItemCooldown("{safe_name}", {ticks});')
+
+    if re.search(r'itemStack\.shrink\s*\(1\)|stack\.shrink\s*\(1\)', body):
+        lines.append(f'        const inv = player.getComponent("minecraft:inventory");')
+        lines.append(f'        if (inv) {{ const slot = inv.container.getSlot(player.selectedSlotIndex); slot.amount = Math.max(0, slot.amount - 1); }}')
+
+    return lines
+
+_INHERITANCE_GRAPH: Dict[str, str] = {}
+_PORTING_NOTES: list = []
+
+def build_inheritance_graph(java_files: Dict[str, str]) -> None:
+    global _INHERITANCE_GRAPH
+    _INHERITANCE_GRAPH = {}
+    for code in java_files.values():
+        for m in re.finditer(
+            r'\bclass\s+(\w+)\s+extends\s+(\w+)',
+            code
+        ):
+            _INHERITANCE_GRAPH[m.group(1)] = m.group(2)
+
+def resolve_superchain(cls_name: str, max_depth: int = 12) -> List[str]:
+    chain = []
+    current = cls_name
+    seen = set()
+    for _ in range(max_depth):
+        parent = _INHERITANCE_GRAPH.get(current)
+        if not parent or parent in seen:
+            break
+        chain.append(parent)
+        seen.add(parent)
+        current = parent
+    return chain
+
+def class_extends_any(cls_name: str, targets: Set[str]) -> bool:
+    if cls_name in targets:
+        return True
+    for ancestor in resolve_superchain(cls_name):
+        if ancestor in targets:
+            return True
+    return False
+
+_MIXIN_TARGET_TO_BEDROCK: Dict[str, Tuple[str, str, str]] = {
+    "LivingEntity":        ("afterEvents", "entityHurt",              "event.hurtEntity"),
+    "Player":              ("afterEvents", "playerInteractWithBlock",  "event.player"),
+    "ServerPlayer":        ("afterEvents", "playerInteractWithBlock",  "event.player"),
+    "Mob":                 ("afterEvents", "entitySpawn",              "event.entity"),
+    "PathfinderMob":       ("afterEvents", "entitySpawn",              "event.entity"),
+    "Animal":              ("afterEvents", "entitySpawn",              "event.entity"),
+    "Monster":             ("afterEvents", "entitySpawn",              "event.entity"),
+    "AbstractArrow":       ("afterEvents", "projectileHitEntity",      "event.projectile"),
+    "Arrow":               ("afterEvents", "projectileHitEntity",      "event.projectile"),
+    "ThrownPotion":        ("afterEvents", "projectileHitEntity",      "event.projectile"),
+    "ItemEntity":          ("afterEvents", "itemStartPickUp",          "event.itemEntity"),
+    "BlockEntity":         ("afterEvents", "playerInteractWithBlock",  "event.block"),
+    "Level":               ("afterEvents", "worldInitialize",          "event"),
+    "ServerLevel":         ("afterEvents", "worldInitialize",          "event"),
+    "UseOnContext":        ("afterEvents", "playerInteractWithBlock",  "event"),
+    "InteractionHand":     ("afterEvents", "playerInteractWithBlock",  "event"),
+}
+
+_INJECT_HEAD_BEDROCK: Dict[str, str] = {
+    "tick":          "world.afterEvents.entityHurt",
+    "hurt":          "world.afterEvents.entityHurt",
+    "die":           "world.afterEvents.entityDie",
+    "aiStep":        "world.afterEvents.entitySpawn",
+    "interact":      "world.afterEvents.playerInteractWithEntity",
+    "interactAt":    "world.afterEvents.playerInteractWithEntity",
+    "use":           "world.afterEvents.useItem",
+    "attack":        "world.afterEvents.entityHitEntity",
+    "performAttack": "world.afterEvents.entityHitEntity",
+    "shoot":         "world.afterEvents.projectileHitEntity",
+    "onBlockActivated": "world.afterEvents.playerInteractWithBlock",
+    "use":           "world.afterEvents.playerInteractWithBlock",
+    "playerDestroy": "world.afterEvents.playerBreakBlock",
+    "place":         "world.afterEvents.playerPlaceBlock",
+    "onRemove":      "world.afterEvents.playerBreakBlock",
+    "explode":       "world.afterEvents.explosion",
+    "onCraftedBy":   "world.afterEvents.crafted",
+    "finishUsingItem": "world.afterEvents.useItem",
+    "onEquip":       "world.afterEvents.playerInteractWithBlock",
+}
+
+def scan_mixins(java_files: Dict[str, str], namespace: str) -> None:
+    for path, code in java_files.items():
+        mixin_m = re.search(r'@Mixin\s*\(\s*(?:value\s*=\s*)?(\w+)\.class', code)
+        if not mixin_m:
+            continue
+        target_cls = mixin_m.group(1)
+        cls_name = extract_class_name(code) or os.path.splitext(os.path.basename(path))[0]
+        safe_name = sanitize_identifier(cls_name)
+
+        inject_methods = re.findall(
+            r'@Inject\s*\([^)]*method\s*=\s*["\'](\w+)["\'][^)]*\)[^{]*'
+            r'(?:public|private|protected)\s+\w+\s+(\w+)\s*\(',
+            code, re.DOTALL
+        )
+        redirect_methods = re.findall(
+            r'@Redirect\s*\([^)]*method\s*=\s*["\'](\w+)["\'][^)]*\)[^{]*'
+            r'(?:public|private|protected)\s+\w+\s+(\w+)\s*\(',
+            code, re.DOTALL
+        )
+        overwrite_methods = re.findall(
+            r'@Overwrite[^{]*(?:public|private|protected)\s+\w+\s+(\w+)\s*\(',
+            code, re.DOTALL
+        )
+
+        bedrock_info = _MIXIN_TARGET_TO_BEDROCK.get(target_cls)
+        if not bedrock_info and target_cls in _INHERITANCE_GRAPH:
+            for ancestor in resolve_superchain(target_cls):
+                if ancestor in _MIXIN_TARGET_TO_BEDROCK:
+                    bedrock_info = _MIXIN_TARGET_TO_BEDROCK[ancestor]
+                    break
+
+        script_lines = [f'import {{ world, system }} from "@minecraft/server";', '']
+        wrote_anything = False
+
+        for target_method, handler_method in inject_methods:
+            bedrock_event = _INJECT_HEAD_BEDROCK.get(target_method)
+            if bedrock_event:
+                body = _extract_method_body(code, handler_method)
+                translated = _translate_use_body(body, namespace, safe_name) if body else []
+                script_lines += [
+                    f'{bedrock_event}.subscribe((event) => {{',
+                ] + (translated if translated else [
+                    f'    const entity = event.entity ?? event.player ?? event.hurtEntity;',
+                    f'    if (!entity) return;',
+                ]) + ['});', '']
+                wrote_anything = True
+            else:
+                _PORTING_NOTES.append(
+                    f"[mixin] {cls_name}: @Inject on {target_cls}.{target_method}() "
+                    f"has no automatic Bedrock mapping — port manually using Scripting API"
+                )
+
+        for target_method, handler_method in redirect_methods:
+            _PORTING_NOTES.append(
+                f"[mixin] {cls_name}: @Redirect on {target_cls}.{target_method}() "
+                f"cannot be automatically translated — @Redirect modifies a specific call site inside a method, "
+                f"which has no Bedrock equivalent. Consider rewriting as a separate event subscription."
+            )
+
+        for method_name in overwrite_methods:
+            body = _extract_method_body(code, method_name)
+            bedrock_event = _INJECT_HEAD_BEDROCK.get(method_name)
+            if bedrock_event and body:
+                translated = _translate_use_body(body, namespace, safe_name)
+                script_lines += [
+                    f'{bedrock_event}.subscribe((event) => {{',
+                ] + (translated if translated else [
+                    f'    const entity = event.entity ?? event.player ?? event.hurtEntity;',
+                ]) + ['});', '']
+                wrote_anything = True
+            else:
+                _PORTING_NOTES.append(
+                    f"[mixin] {cls_name}: @Overwrite of {target_cls}.{method_name}() "
+                    f"has no automatic Bedrock mapping — port manually"
+                )
+
+        if wrote_anything:
+            out_path = os.path.join(BP_FOLDER, "scripts", f"mixin_{safe_name}.js")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(script_lines))
+            print(f"[mixin] Wrote {out_path}")
+
+_CAP_FIELD_TYPE_MAP = {
+    "int": "number",
+    "float": "number",
+    "double": "number",
+    "long": "number",
+    "boolean": "boolean",
+    "String": "string",
+    "ItemStack": "string",
+    "ResourceLocation": "string",
+}
+
+def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
+    for path, code in java_files.items():
+        is_cap = bool(re.search(
+            r'implements\s+(?:[A-Za-z,\s]*\b(?:ICapabilityProvider|ICapabilitySerializable|INBTSerializable)\b)',
+            code
+        ))
+        if not is_cap:
+            continue
+        cls_name = extract_class_name(code) or os.path.splitext(os.path.basename(path))[0]
+        safe_name = sanitize_identifier(cls_name)
+
+        fields = re.findall(
+            r'(?:private|protected|public)\s+(int|float|double|long|boolean|String|ItemStack|ResourceLocation)\s+(\w+)\s*(?:=|;)',
+            code
+        )
+        if not fields:
+            _PORTING_NOTES.append(
+                f"[capability] {cls_name}: implements ICapabilityProvider but no simple fields detected — "
+                f"convert to Bedrock dynamic properties manually"
+            )
+            continue
+
+        script_lines = [f'import {{ world }} from "@minecraft/server";', '']
+
+        for java_type, field_name in fields:
+            bedrock_type = _CAP_FIELD_TYPE_MAP.get(java_type, "string")
+            script_lines.append(
+                f'world.afterEvents.worldInitialize.subscribe((e) => {{'
+            )
+            script_lines.append(
+                f'    e.propertyRegistry.defineEntityNumberProperty("{namespace}:{safe_name}_{field_name}", 0);'
+                if bedrock_type == "number" else
+                f'    e.propertyRegistry.defineEntityStringProperty("{namespace}:{safe_name}_{field_name}", "");'
+                if bedrock_type == "string" else
+                f'    e.propertyRegistry.defineEntityBooleanProperty("{namespace}:{safe_name}_{field_name}", false);'
+            )
+            script_lines.append('});')
+            script_lines.append('')
+
+        getter_methods = re.findall(
+            r'public\s+\S+\s+(get\w+)\s*\(\s*\)',
+            code
+        )
+        setter_methods = re.findall(
+            r'public\s+void\s+(set\w+)\s*\(\s*\S+\s+(\w+)\s*\)',
+            code
+        )
+
+        if getter_methods or setter_methods:
+            script_lines += [
+                f'function getCapability(entity, key) {{',
+                f'    return entity.getDynamicProperty("{namespace}:{safe_name}_" + key);',
+                f'}}',
+                '',
+                f'function setCapability(entity, key, value) {{',
+                f'    entity.setDynamicProperty("{namespace}:{safe_name}_" + key, value);',
+                f'}}',
+                '',
+            ]
+
+        out_path = os.path.join(BP_FOLDER, "scripts", f"cap_{safe_name}.js")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(script_lines))
+        print(f"[capability] Wrote {out_path}")
+
+_PACKET_HANDLER_PATTERNS = [
+    r'SimpleChannel\s*\.\s*(?:newSimpleChannel|create)\s*\(\s*(?:new\s+)?ResourceLocation\s*\(\s*["\']([^"\']+)["\']',
+    r'ChannelBuilder\s*\.\s*named\s*\(\s*(?:new\s+)?ResourceLocation\s*\(\s*["\']([^"\']+)["\']',
+    r'NetworkRegistry\s*\.\s*newSimpleChannel\s*\(\s*(?:new\s+)?ResourceLocation\s*\(\s*["\']([^"\']+)["\']',
+]
+
+def scan_networking(java_files: Dict[str, str], namespace: str) -> None:
+    channel_files = {}
+    packet_classes = {}
+
+    for path, code in java_files.items():
+        for pat in _PACKET_HANDLER_PATTERNS:
+            m = re.search(pat, code)
+            if m:
+                channel_files[path] = (code, m.group(1))
+                break
+
+        if re.search(r'implements\s+(?:[A-Za-z,\s]*\b(?:CustomPacketPayload|FriendlyByteBuf)\b)', code):
+            cls_name = extract_class_name(code)
+            if cls_name:
+                packet_classes[cls_name] = code
+
+        reg_patterns = re.findall(
+            r'\.registerMessage\s*\([^,]+,\s*(\w+)\.class',
+            code
+        ) + re.findall(
+            r'\.messageBuilder\s*\(\s*(\w+)\.class',
+            code
+        )
+        for pcls in reg_patterns:
+            if pcls not in packet_classes:
+                packet_classes[pcls] = ""
+
+    if not channel_files and not packet_classes:
+        return
+
+    script_lines = [f'import {{ world, system }} from "@minecraft/server";', '']
+
+    for pcls, pcode in packet_classes.items():
+        safe = sanitize_identifier(pcls)
+        fields = re.findall(
+            r'(?:private|public|protected|final)\s+(?:final\s+)?(\w+)\s+(\w+)\s*[;=]',
+            pcode
+        ) if pcode else []
+
+        script_lines += [
+            f'world.afterEvents.scriptEventReceive.subscribe((event) => {{',
+            f'    if (event.id !== "{namespace}:{safe}") return;',
+        ]
+
+        if fields:
+            script_lines.append(f'    const data = JSON.parse(event.message);')
+            for ftype, fname in fields[:8]:
+                bedrock_type = _CAP_FIELD_TYPE_MAP.get(ftype, "any")
+                script_lines.append(f'    const {fname} = data.{fname};')
+        else:
+            script_lines.append(f'    const data = JSON.parse(event.message);')
+
+        script_lines += [
+            f'    const player = [...world.getAllPlayers()].find(p => p.name === data.sender);',
+            f'    if (!player) return;',
+            f'}});',
+            '',
+        ]
+
+        _PORTING_NOTES.append(
+            f"[network] Packet {pcls} converted to scriptEventReceive id={namespace}:{safe} — "
+            f"Java-side packet sending must be replaced with '/scriptevent {namespace}:{safe} {{...}}' calls or "
+            f"equivalent Scripting API scriptEventReceive triggers"
+        )
+
+    if script_lines[-1] != '':
+        script_lines.append('')
+
+    out_path = os.path.join(BP_FOLDER, "scripts", "network_packets.js")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(script_lines))
+    print(f"[network] Wrote {out_path}")
+
+_CLIENT_RENDERER_BASES = {
+    "EntityRenderer", "MobRenderer", "LivingEntityRenderer",
+    "BlockEntityRenderer", "ParticleEngine", "GameRenderer",
+    "ItemRenderer", "FontRenderer", "GlStateManager",
+    "RenderType", "VertexConsumer", "PoseStack",
+    "ShaderInstance", "PostChain",
+}
+
+_CLIENT_ONLY_IMPORTS = {
+    "net.minecraft.client", "com.mojang.blaze3d", "net.minecraftforge.client",
+    "net.neoforged.neoforge.client", "net.fabricmc.fabric.api.client",
+}
+
+def detect_client_only(java_code: str, cls_name: str) -> Optional[str]:
+    for imp in _CLIENT_ONLY_IMPORTS:
+        if f"import {imp}" in java_code:
+            return f"uses client-only import package {imp}"
+
+    superclass_m = re.search(r'\bextends\s+(\w+)', java_code)
+    if superclass_m:
+        base = superclass_m.group(1)
+        if base in _CLIENT_RENDERER_BASES:
+            return f"extends {base}"
+        for ancestor in resolve_superchain(base):
+            if ancestor in _CLIENT_RENDERER_BASES:
+                return f"extends {base} (which extends {ancestor})"
+
+    if re.search(r'@OnlyIn\s*\(\s*Dist\.CLIENT\s*\)|@Environment\s*\(\s*EnvType\.CLIENT\s*\)', java_code):
+        return "@OnlyIn(Dist.CLIENT) annotation"
+
+    return None
+
+def scan_client_classes(java_files: Dict[str, str]) -> None:
+    for path, code in java_files.items():
+        cls_name = extract_class_name(code) or os.path.splitext(os.path.basename(path))[0]
+        reason = detect_client_only(code, cls_name)
+        if reason:
+            _PORTING_NOTES.append(
+                f"[client-only] {cls_name} ({reason}): "
+                f"client-side rendering has no Bedrock equivalent. "
+                f"Textures/models are handled by the RP; custom shaders and render layers cannot be ported."
+            )
+
+def write_porting_notes() -> None:
+    if not _PORTING_NOTES:
+        return
+    out_path = os.path.join(OUTPUT_DIR, "PORTING_NOTES.txt")
+    categories = {"mixin": [], "capability": [], "network": [], "client-only": [], "other": []}
+    for note in _PORTING_NOTES:
+        matched = False
+        for cat in categories:
+            if note.startswith(f"[{cat}]"):
+                categories[cat].append(note)
+                matched = True
+                break
+        if not matched:
+            categories["other"].append(note)
+    lines = [
+        "ModMorpher — Porting Notes",
+        "=" * 60,
+        "",
+        "These items could not be automatically converted and require",
+        "manual attention before the addon will be fully functional.",
+        "",
+    ]
+    section_titles = {
+        "mixin": "Mixin Injections",
+        "capability": "Capability Providers",
+        "network": "Network Packets",
+        "client-only": "Client-Side Rendering",
+        "other": "Other",
+    }
+    for cat, notes in categories.items():
+        if not notes:
+            continue
+        lines += [section_titles[cat], "-" * len(section_titles[cat])]
+        for note in notes:
+            body = re.sub(r'^\[' + cat + r'\]\s*', '', note)
+            lines.append(f"  {body}")
+        lines.append("")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[notes] Wrote {out_path} ({len(_PORTING_NOTES)} item(s))")
+
+_FORGE_EVENT_MAP = {
+    "PlayerInteractEvent.EntityInteract":  ("afterEvents", "playerInteractWithEntity"),
+    "PlayerInteractEvent.RightClickBlock": ("afterEvents", "playerInteractWithBlock"),
+    "PlayerInteractEvent.RightClickItem":  ("afterEvents", "useItem"),
+    "PlayerInteractEvent.LeftClickBlock":  ("afterEvents", "playerBreakBlock"),
+    "LivingHurtEvent":                     ("afterEvents", "entityHurt"),
+    "LivingDeathEvent":                    ("afterEvents", "entityDie"),
+    "BlockEvent.BreakEvent":               ("afterEvents", "playerBreakBlock"),
+    "BlockEvent.PlaceEvent":               ("afterEvents", "playerPlaceBlock"),
+    "EntityJoinLevelEvent":                ("afterEvents", "entitySpawn"),
+    "ItemCraftedEvent":                    ("afterEvents", "crafted"),
+    "PlayerEvent.ItemPickupEvent":         ("afterEvents", "itemStartPickUp"),
+}
+
+def _find_static_event_handlers(java_code: str) -> list:
+    handlers = []
+    seen = set()
+    for event_type, (phase, bedrock_event) in _FORGE_EVENT_MAP.items():
+        short = event_type.split(".")[-1]
+        pat = (
+            r'(?:(?:public|private|protected)\s+)?static\s+\w+\s+(\w+)\s*\('
+            r'[^)]*?' + re.escape(short) + r'\s+(\w+)[^)]*?\)'
+        )
+        for m in re.finditer(pat, java_code, re.DOTALL):
+            method_name = m.group(1)
+            if method_name in seen:
+                continue
+            seen.add(method_name)
+            param_name = m.group(2)
+            start = java_code.find('{', m.end())
+            if start == -1:
+                continue
+            depth, i = 0, start
+            body = ""
+            while i < len(java_code):
+                if java_code[i] == '{':
+                    depth += 1
+                elif java_code[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        body = java_code[start:i + 1]
+                        break
+                i += 1
+            if body:
+                handlers.append((method_name, event_type, phase, bedrock_event, param_name, body))
+    return handlers
+
+def _extract_tag_path(java_code: str, field_name: str) -> Optional[str]:
+    pat = (
+        r'\b' + re.escape(field_name) + r'\b[^=\n]*=\s*TagKey\.create\s*\([^,]+,\s*'
+        r'ResourceLocation\.(?:fromNamespaceAndPath|of|parse|withDefaultNamespace)\s*\('
+        r'[^,)]+,\s*["\']([^"\']+)["\']'
+    )
+    m = re.search(pat, java_code, re.DOTALL)
+    if m:
+        return m.group(1)
+    pat2 = (
+        r'\b' + re.escape(field_name) + r'\b[^=\n]*=\s*TagKey\.create\s*\([^,]+,\s*'
+        r'new\s+ResourceLocation\s*\([^,)]+,\s*["\']([^"\']+)["\']'
+    )
+    m2 = re.search(pat2, java_code, re.DOTALL)
+    return m2.group(1) if m2 else None
+
+def _get_player_var(event_type: str, param: str) -> str:
+    player_events = {
+        "PlayerInteractEvent.EntityInteract",
+        "PlayerInteractEvent.RightClickBlock",
+        "PlayerInteractEvent.RightClickItem",
+        "PlayerInteractEvent.LeftClickBlock",
+        "ItemCraftedEvent",
+        "PlayerEvent.ItemPickupEvent",
+    }
+    if event_type in player_events:
+        return f"{param}.player"
+    if event_type in ("LivingHurtEvent", "LivingDeathEvent"):
+        return f"{param}.entity"
+    return f"{param}.player"
+
+def _translate_handler_body(java_body: str, event_type: str, param: str, java_code_full: str, namespace: str, safe_name: str) -> list:
+    lines = []
+    player = _get_player_var(event_type, param)
+
+    needs_inv = bool(re.search(r'\.shrink\s*\(|\.addItem\s*\(|getItemStack\s*\(', java_body))
+    needs_block = bool(re.search(r'setBlock\s*\(|getBlockState\s*\(|getBlockPos\s*\(|getHitVec\s*\(', java_body))
+
+    if needs_inv:
+        lines.append(f'    const inv = {player}.getComponent("minecraft:inventory").container;')
+        lines.append(f'    const heldSlot = {player}.selectedSlotIndex;')
+        lines.append(f'    let heldItem = inv.getItem(heldSlot);')
+
+    if event_type == "PlayerInteractEvent.RightClickBlock" and needs_block:
+        lines.append(f'    const block = {param}.block;')
+
+    if event_type == "PlayerInteractEvent.EntityInteract":
+        lines.append(f'    const target = {param}.target;')
+
+    if re.search(r'isCrouching\s*\(\s*\)|isSneaking\s*\(\s*\)', java_body):
+        lines.append(f'    if (!{player}.isSneaking) return;')
+
+    null_checks = re.findall(r'(\w+)\s*!=\s*null', java_body)
+    entity_null = any(c in ("entityInteractEvent", param, "entity", "player") for c in null_checks)
+    if not entity_null and re.search(r'getEntity\s*\(\s*\)\s*!=\s*null', java_body):
+        lines.append(f'    if (!{player}) return;')
+
+    target_type_check = re.search(
+        r'getTarget\s*\(\s*\)\.getType\s*\(\s*\)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
+        java_body
+    )
+    if target_type_check:
+        ref = target_type_check.group(1).split(".")[-1]
+        tag_path = _extract_tag_path(java_code_full, ref)
+        entity_hint = sanitize_identifier(tag_path.split("_for_")[0] if tag_path and "_for_" in tag_path else (tag_path or ref))
+        lines.append(f'    if (!target || !target.typeId.includes("{entity_hint}")) return;')
+
+    item_is_checks = re.findall(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.is\s*\(\s*(\w+)\s*\)', java_body)
+    for tag_ref in item_is_checks:
+        tag_path = _extract_tag_path(java_code_full, tag_ref)
+        if tag_path:
+            lines.append(f'    if (!heldItem || !heldItem.hasTag("{namespace}:{tag_path}")) return;')
+        else:
+            lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(tag_ref)}") return;')
+
+    item_identity_check = re.search(
+        r'(?:stack|itemStack|heldStack)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
+        java_body
+    )
+    if item_identity_check and not item_is_checks:
+        ref = item_identity_check.group(1).split(".")[-1]
+        lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(ref)}") return;')
+
+    repair_call = bool(re.search(r'repairState\s*\(', java_body))
+    if repair_call:
+        lines.append(f'    const repairedId = repairBlockId(block.typeId);')
+        lines.append(f'    if (!repairedId) return;')
+
+    hurt_break = re.search(r'hurtAndBreak\s*\(\s*(\d+)', java_body)
+    if hurt_break:
+        dmg = int(hurt_break.group(1))
+        lines.append(f'    const dur = heldItem?.getComponent("minecraft:durability");')
+        lines.append(f'    if (dur) {{ dur.damage = Math.min(dur.damage + {dmg}, dur.maxDurability); inv.setItem(heldSlot, heldItem); }}')
+
+    if re.search(r'level\.setBlock\s*\(', java_body):
+        if repair_call:
+            lines.append(f'    block.setPermutation(BlockPermutation.resolve(repairedId));')
+        else:
+            lines.append(f'    block.setPermutation(block.permutation);')
+
+    play_sound = re.search(
+        r'playSound\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*SoundEvents\.(\w+)',
+        java_body
+    )
+    if play_sound:
+        bedrock_sound = _SOUND_NAME_MAP.get(play_sound.group(1), "random.pop")
+        lines.append(f'    {player}.dimension.playSound("{bedrock_sound}", {player}.location);')
+
+    if re.search(r'\.swing\s*\(', java_body):
+        lines.append(f'    {player}.playAnimation("animation.player.attack.rotations");')
+
+    instabuild = bool(re.search(r'getAbilities\s*\(\s*\)\.instabuild|isCreative\s*\(\s*\)', java_body))
+    shrink = re.search(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.shrink\s*\(\s*(\d+)\s*\)', java_body)
+    if shrink:
+        amt = int(shrink.group(1))
+        if instabuild:
+            lines.append(f'    if ({player}.getGameMode() !== GameMode.creative) {{')
+            lines.append(f'        if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
+            lines.append(f'    }}')
+        else:
+            lines.append(f'    if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
+
+    add_item = re.search(r'addItem\s*\(([^;]+)\)', java_body)
+    if add_item:
+        arg = add_item.group(1).strip()
+        const_m = re.search(r'\.([A-Z][A-Z0-9_]+)\b', arg)
+        if const_m:
+            const_name = const_m.group(1)
+            reg_m = re.search(
+                r'\b' + re.escape(const_name) + r'\b[^\n]*register\s*\(\s*["\']([a-z0-9_]+)["\']',
+                java_code_full, re.I
+            )
+            item_name = reg_m.group(1) if reg_m else sanitize_identifier(const_name)
+        else:
+            plain = arg.split(".")[0].strip()
+            item_name = sanitize_identifier(plain)
+        lines.append(f'    inv.addItem(new ItemStack("{namespace}:{item_name}"));')
+
+    return lines
+
+def _needs_repair_helper(handlers: list) -> bool:
+    return any(re.search(r'repairState\s*\(', body) for _, _, _, _, _, body in handlers)
+
+def _emit_repair_helper() -> list:
+    return [
+        'function repairBlockId(typeId) {',
+        '    const path = typeId.replace(/^minecraft:/, "");',
+        '    let modified = path',
+        '        .replace(/^damaged_/, "chipped_")',
+        '        .replace(/_damaged$/, "_chipped")',
+        '        .replace(/_damaged_/, "_chipped_");',
+        '    if (modified !== path) return "minecraft:" + modified;',
+        '    for (const word of ["cracked", "mossy", "polished", "chiseled", "smooth", "cut", "chipped"]) {',
+        '        modified = path',
+        '            .replace(new RegExp("^" + word + "_"), "")',
+        '            .replace(new RegExp("_" + word + "$"), "")',
+        '            .replace(new RegExp("_" + word + "_"), "_");',
+        '        if (modified !== path) return "minecraft:" + modified;',
+        '    }',
+        '    return null;',
+        '}',
+    ]
+
+def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namespace: str) -> bool:
+    use_body = _extract_method_body(java_code, "use")
+    hurt_body = _extract_method_body(java_code, "hurtEnemy")
+    tick_body = _extract_method_body(java_code, "inventoryTick")
+    static_handlers = _find_static_event_handlers(java_code)
+
+    if not any([use_body, hurt_body, tick_body]) and not static_handlers:
+        return False
+
+    needs_permutation = _needs_repair_helper(static_handlers)
+    base_imports = "world, system, GameMode, ItemStack"
+    if needs_permutation:
+        base_imports += ", BlockPermutation"
+    script_lines = [f'import {{ {base_imports} }} from "@minecraft/server";', '']
+
+    has_instance_methods = any([use_body, hurt_body, tick_body])
+    if has_instance_methods:
+        script_lines += [
+            f'const COMPONENT_ID = "{namespace}:{safe_name}_use";',
+            '',
+            'class UseHandler {',
+        ]
+        if use_body:
+            translated = _translate_use_body(use_body, namespace, safe_name)
+            script_lines += ['    onUse(event) {', '        const player = event.source;', '        if (!player) return;'] + translated + ['    }']
+        if hurt_body:
+            translated = _translate_use_body(hurt_body, namespace, safe_name)
+            script_lines += ['    onHitEntity(event) {', '        const player = event.attackingEntity;', '        if (!player) return;'] + translated + ['    }']
+        if tick_body:
+            script_lines += ['    onMineBlock(event) {', '        const player = event.source;', '        if (!player) return;', '    }']
+        script_lines += [
+            '}',
+            '',
+            'world.beforeEvents.worldInitialize.subscribe((e) => {',
+            f'    e.itemComponentRegistry.registerCustomComponent(COMPONENT_ID, new UseHandler());',
+            '});',
+        ]
+
+    for _, event_type, phase, bedrock_event, param, body in static_handlers:
+        if script_lines and script_lines[-1] != '':
+            script_lines.append('')
+        translated = _translate_handler_body(body, event_type, param, java_code, namespace, safe_name)
+        script_lines += [f'world.{phase}.{bedrock_event}.subscribe(({param}) => {{'] + translated + ['});']
+
+    if _needs_repair_helper(static_handlers):
+        script_lines += [''] + _emit_repair_helper()
+
+    out_path = os.path.join(BP_FOLDER, "scripts", f"{safe_name}.js")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(script_lines))
+    print(f"[script] Wrote {out_path}")
+    return True
+
 def convert_java_item_full(java_code: str, java_path: str, namespace: str):
     cls = extract_class_name(java_code) or os.path.splitext(os.path.basename(java_path))[0]
     safe_name = sanitize_identifier(cls)
@@ -5196,6 +6057,15 @@ def convert_java_item_full(java_code: str, java_path: str, namespace: str):
         components["minecraft:enchantable"] = {"value": enchant_value, "slot": ench_slot}
     if re.search(r'isFoil|hasGlint|isEnchanted', java_code, re.I):
         components["minecraft:glint"] = True
+    has_instance_use = bool(re.search(
+        r'@Override\s+public\s+\S+\s+(?:use|hurtEnemy|inventoryTick)\s*\(',
+        java_code, re.DOTALL
+    ))
+    has_static_handlers = bool(_find_static_event_handlers(java_code))
+    if has_instance_use or has_static_handlers:
+        stub_written = generate_scripting_stub(java_code, safe_name, item_id, namespace)
+        if stub_written and has_instance_use:
+            components["minecraft:custom_components"] = [f"{namespace}:{safe_name}_use"]
     out_path = os.path.join(BP_FOLDER, "items", f"{safe_name}.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     safe_write_json(out_path, doc)
@@ -5935,12 +6805,14 @@ def run_prescan(java_files: dict, namespace: str) -> str:
     global ENTITY_REGISTRY, ATTRS_REGISTRY, SOUND_CONST_MAP
     detected = detect_mod_id(java_files)
     ns = detected or namespace
+    build_inheritance_graph(java_files)
     ENTITY_REGISTRY = build_entity_registry(java_files, ns)
     ATTRS_REGISTRY  = build_attributes_registry(java_files)
     SOUND_CONST_MAP = build_sound_registry_from_java(java_files, ns)
     build_goal_inheritance_map(java_files)
     print(f"[prescan] mod_id={ns!r} | entities={len(ENTITY_REGISTRY)} | "
-          f"attr_classes={len(ATTRS_REGISTRY)} | sounds={len(SOUND_CONST_MAP)}")
+          f"attr_classes={len(ATTRS_REGISTRY)} | sounds={len(SOUND_CONST_MAP)} | "
+          f"inheritance_graph={len(_INHERITANCE_GRAPH)}")
     for cls, eid in list(ENTITY_REGISTRY.items())[:6]:
         print(f"  {cls} -> {eid}")
     return ns
@@ -6683,6 +7555,8 @@ def run_pipeline():
         normalise_all_geometry_to_geckolib(RP_FOLDER, namespace)
     with _logger.phase("Indexing RP assets", total=0, unit="step", colour="blue"):
         build_rp_asset_index()
+    global _PORTING_NOTES
+    _PORTING_NOTES = []
     stats = {
         "converted_entities_bp": [],
         "converted_entities_rp": [],
@@ -6691,6 +7565,8 @@ def run_pipeline():
         "errors":                [],
         "converted_items":       [],
         "converted_blocks":      [],
+        "scripts_written":       [],
+        "mixins_converted":      [],
     }
     with _logger.phase("Reading Java source", total=0, unit="file", colour="blue"):
         java_files = read_all_java_files(".")
@@ -6719,24 +7595,34 @@ def run_pipeline():
             lname  = fname.lower()
             bar.set_postfix_str(fname[:38])
             try:
+                cls_for_graph = extract_class_name(code)
+                superchain = resolve_superchain(cls_for_graph) if cls_for_graph else []
+                superchain_str = " ".join(superchain)
+
                 fname_item_hint   = lname.endswith("item.java")  or "_item"  in lname
                 fname_block_hint  = lname.endswith("block.java") or "_block" in lname
                 fname_entity_hint = any(k in lname for k in ENTITY_OVERRIDE_KEYWORDS)
                 fname_noise       = any(k in lname for k in NON_ENTITY_KEYWORDS) and not fname_entity_hint
+
+                _ITEM_BASES = r'Item|SwordItem|PickaxeItem|ShovelItem|AxeItem|HoeItem|ArmorItem|BowItem|ShieldItem|FoodOnAStickItem|ThrowablePotionItem|TieredItem|DiggerItem|BlockItem|DoubleHighBlockItem|StandingAndWallBlockItem'
+                _BLOCK_BASES = r'Block|BaseBlock|HalfTransparentBlock|BushBlock|FlowerBlock|SaplingBlock|CropBlock|TrapDoorBlock|DoorBlock|FenceBlock|WallBlock|StairBlock|SlabBlock|PressurePlateBlock|ButtonBlock|LeverBlock|TorchBlock|RedStoneWireBlock|ChestBlock|FurnaceBlock|LiquidBlock|GrassBlock|RotatedPillarBlock|HorizontalDirectionalBlock|DirectionalBlock'
+
                 item_content_signals = [
-                    bool(re.search(r'\bextends\s+(?:Item|SwordItem|PickaxeItem|ShovelItem|AxeItem|HoeItem|ArmorItem|BowItem|ShieldItem|FoodOnAStickItem|ThrowablePotionItem|TieredItem|DiggerItem|BlockItem|DoubleHighBlockItem|StandingAndWallBlockItem)\b', code)),
+                    bool(re.search(r'\bextends\s+(?:' + _ITEM_BASES + r')\b', code)),
                     bool(re.search(r'Item\.Properties\(\)|new\s+Item\.Properties\b|Item\.Properties\.of\b', code)),
                     bool(re.search(r'\.stacksTo\s*\(|\.durability\s*\(|FoodProperties\.Builder\b', code)),
                     bool(re.search(r'@Override\s+public\s+\w+\s+use\s*\(Level|InteractionResultHolder<ItemStack>', code)),
                     fname_item_hint,
+                    bool(re.search(r'\b(?:' + _ITEM_BASES.replace('|', r'\b|\b') + r')\b', superchain_str)),
                 ]
                 is_item = sum(item_content_signals) >= 2 or (fname_item_hint and sum(item_content_signals) >= 1)
                 block_content_signals = [
-                    bool(re.search(r'\bextends\s+(?:Block|BaseBlock|HalfTransparentBlock|BushBlock|FlowerBlock|SaplingBlock|CropBlock|TrapDoorBlock|DoorBlock|FenceBlock|WallBlock|StairBlock|SlabBlock|PressurePlateBlock|ButtonBlock|LeverBlock|TorchBlock|RedStoneWireBlock|ChestBlock|FurnaceBlock|LiquidBlock|GrassBlock|RotatedPillarBlock|HorizontalDirectionalBlock|DirectionalBlock)\b', code)),
+                    bool(re.search(r'\bextends\s+(?:' + _BLOCK_BASES + r')\b', code)),
                     bool(re.search(r'BlockBehaviour\.Properties|Block\.Properties\s*\.of\b|BlockBehaviour\.Properties\.of\b', code)),
                     bool(re.search(r'\.strength\s*\(|\.noCollission\s*\(|\.lightLevel\s*\(|\.randomTicks\s*\(', code)),
                     bool(re.search(r'@Override\s+public\s+\w+\s+use\s*\(BlockState|getStateForPlacement\s*\(', code)),
                     fname_block_hint,
+                    bool(re.search(r'\b(?:' + _BLOCK_BASES.replace('|', r'\b|\b') + r')\b', superchain_str)),
                 ]
                 is_block = sum(block_content_signals) >= 2 or (fname_block_hint and sum(block_content_signals) >= 1)
                 entity_candidate = (
@@ -6778,6 +7664,14 @@ def run_pipeline():
         generate_texture_registry(pack_display_name)
         generate_sounds_registry(namespace)
         convert_lang_files()
+    with _logger.phase("Scanning mixins", total=0, unit="step", colour="magenta"):
+        scan_mixins(java_files, namespace)
+    with _logger.phase("Scanning capabilities", total=0, unit="step", colour="magenta"):
+        scan_capabilities(java_files, namespace)
+    with _logger.phase("Scanning networking", total=0, unit="step", colour="magenta"):
+        scan_networking(java_files, namespace)
+    with _logger.phase("Scanning client-only classes", total=0, unit="step", colour="magenta"):
+        scan_client_classes(java_files)
     if jar_path:
         with _logger.phase("Processing loot / recipes / tags", total=0, unit="step", colour="blue"):
             process_loot_tables_from_jar(jar_path, namespace)
@@ -6788,6 +7682,8 @@ def run_pipeline():
     with _logger.phase("Writing manifests", total=0, unit="step", colour="blue"):
         write_manifest_for(BP_FOLDER, pack_display_name, "BP")
         write_manifest_for(RP_FOLDER, pack_display_name, "RP")
+    with _logger.phase("Writing porting notes", total=0, unit="step", colour="yellow"):
+        write_porting_notes()
     validation_warnings = []
     with _logger.phase("Validating output", total=0, unit="step", colour="blue"):
         validation_warnings = run_validation_pass()
@@ -6813,6 +7709,12 @@ def run_pipeline():
     _orig(f"    Spawn rules   {spawn_count:>4}                        ")
     if struct_count:
         _orig(f"    Structures    {struct_count:>4}  ({feat_count} feature JSONs)   ")
+    scripts_dir = os.path.join(BP_FOLDER, "scripts")
+    script_count = len([f for f in os.listdir(scripts_dir) if f.endswith(".js") and f != "main.js"]) if os.path.isdir(scripts_dir) else 0
+    if script_count:
+        _orig(f"    Scripts       {script_count:>4}                        ")
+    if _PORTING_NOTES:
+        _orig(f"    Manual items  {len(_PORTING_NOTES):>4}  (see PORTING_NOTES.txt) ")
     _orig("  ")
     if stats["missing_geometry"]:
         _orig(f"\n    {len(stats['missing_geometry'])} entity/entities using placeholder geometry:")

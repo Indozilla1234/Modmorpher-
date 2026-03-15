@@ -69,7 +69,7 @@ If it’s Marketplace/paid content, don’t.
 
 ---
 
-That’s it. It’s a messy tool that tries to do a lot. If it breaks, blame Minecraft modding and maybe the spacetime continuum. ;)
+That’s it. It’s a messy tool that tries to do a lot. If it breaks, blame Minecraft Bedrock and maybe the spacetime continuum. ;)
 
 
    

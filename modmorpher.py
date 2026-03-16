@@ -1,4 +1,6 @@
-Tool_Version = "1.4"
+from __future__ import annotations
+
+Tool_Version = "1.4.1"
 
 import os
 import json
@@ -326,7 +328,7 @@ class JavaAST:
     def translate_java_body_to_js(java_body: str, event_type: str, param: str, namespace: str, safe_name: str) -> list:
         if not JAVALANG_AVAILABLE:
             return []
-        # Wrap the body in a dummy class and method for parsing
+
         dummy_code = f"""
 public class Dummy {{
     public void dummy() {{
@@ -338,7 +340,7 @@ public class Dummy {{
             tree = javalang.parse.parse(dummy_code)
             lines = []
             player = _get_player_var(event_type, param)
-            # Find the method body
+
             for path, node in tree:
                 if isinstance(node, javalang.tree.MethodDeclaration) and node.name == 'dummy':
                     for stmt in node.body:
@@ -349,17 +351,17 @@ public class Dummy {{
             return []
 
 def translate_method_invocation(invocation: object, player: str, namespace: str, symbol_table: JavaSymbolTable) -> Optional[str]:
-    # Enhanced translation with NBT support and capability detection
+
     member = getattr(invocation, 'member', '')
     qualifier = getattr(invocation, 'qualifier', None)
     if qualifier and isinstance(qualifier, str):
-        pass  # It's already a string
+        pass                         
     elif qualifier and isinstance(qualifier, list) and len(qualifier) == 1:
         qualifier = qualifier[0]
     else:
         qualifier = None
     args = getattr(invocation, 'arguments', [])
-    
+
     if member == 'receiveEnergy':
         if args and isinstance(args[0], javalang.tree.Literal):
             amt = args[0].value
@@ -368,17 +370,17 @@ def translate_method_invocation(invocation: object, player: str, namespace: str,
         if args and isinstance(args[0], javalang.tree.Literal):
             amt = args[0].value
             return f'    extractEnergy({player}, {amt});'
-    
-    # NBT Translation: Try to map to Bedrock dynamic properties
+
+
     nbt_result = NBTTranslator.translate_nbt_call(member, args, namespace, player)
     if nbt_result:
         return nbt_result
-    
-    # Capability detection
+
+
     cap_type = symbol_table.method_belongs_to_capability(member)
     if cap_type:
         if cap_type == 'energy' and member not in ('receiveEnergy', 'extractEnergy'):
-            # Handle other energy methods like getEnergyStored
+
             if member == 'getEnergyStored':
                 return f'getEnergyStored({player})'
         elif cap_type == 'fluid':
@@ -388,13 +390,13 @@ def translate_method_invocation(invocation: object, player: str, namespace: str,
             elif member == 'drain' and len(args) >= 1:
                 amount = translate_expression(args[0])
                 return f'    drain({player}, {amount});'
-    
-    # Use the method map for standard translations
+
+
     bedrock_call = JavaToBedrockMethodMap.translate_method_call(member, args, qualifier)
     if bedrock_call:
         return bedrock_call
-    
-    # Add more translations
+
+
     return None
 
 def translate_statement(stmt: object, player: str, namespace: str, symbol_table: JavaSymbolTable) -> list:
@@ -404,15 +406,15 @@ def translate_statement(stmt: object, player: str, namespace: str, symbol_table:
             js_line = translate_method_invocation(expr, player, namespace, symbol_table)
             return [js_line] if js_line else []
         elif isinstance(expr, javalang.tree.Assignment):
-            # Handle assignments like x = y
+
             left = translate_expression(expr.expressionl)
             right = translate_expression(expr.value)
             if left and right:
                 return [f'    {left} = {right};']
     elif isinstance(stmt, javalang.tree.LocalVariableDeclaration):
-        # Handle variable declarations
+
         type_name = stmt.type.name if hasattr(stmt.type, 'name') else str(stmt.type)
-        js_type = 'let'  # Default to let
+        js_type = 'let'                  
         for decl in stmt.declarators:
             var_name = decl.name
             init = ''
@@ -422,11 +424,11 @@ def translate_statement(stmt: object, player: str, namespace: str, symbol_table:
                     init = f' = {init_val}'
             return [f'    {js_type} {var_name}{init};']
     elif isinstance(stmt, javalang.tree.IfStatement):
-        # Handle if statements
+
         condition = translate_expression(stmt.condition)
         if condition:
             lines = [f'    if ({condition}) {{']
-            # Handle then_statement
+
             then_stmts = stmt.then_statement
             if isinstance(then_stmts, javalang.tree.BlockStatement):
                 for s in then_stmts.statements:
@@ -451,28 +453,28 @@ def translate_statement(stmt: object, player: str, namespace: str, symbol_table:
                 lines.append('    }')
             return lines
     elif isinstance(stmt, javalang.tree.ReturnStatement):
-        # Handle return
+
         if stmt.expression:
             expr = translate_expression(stmt.expression)
             return [f'    return {expr};'] if expr else ['    return;']
         else:
             return ['    return;']
     elif isinstance(stmt, javalang.tree.ForStatement):
-        # Handle for loops
+
         init = stmt.initialization
         condition = translate_expression(stmt.condition) if stmt.condition else None
         update = stmt.update
         lines = []
         if condition:
             lines.append(f'    for (let i = 0; {condition}; i++) {{')
-            # Translate loop body
+
             if stmt.body:
                 body_list = stmt.body if isinstance(stmt.body, list) else [stmt.body]
                 for s in body_list:
                     lines.extend(translate_statement(s, player, namespace))
             lines.append('    }')
         return lines
-    # Add more statement types
+
     return []
 
 def translate_expression(expr: object) -> Optional[str]:
@@ -481,7 +483,7 @@ def translate_expression(expr: object) -> Optional[str]:
     elif isinstance(expr, javalang.tree.MemberReference):
         return expr.member
     elif isinstance(expr, javalang.tree.MethodInvocation):
-        # For now, simple translation
+
         member = getattr(expr, 'member', '')
         args = getattr(expr, 'arguments', [])
         arg_strs = []
@@ -496,11 +498,10 @@ def translate_expression(expr: object) -> Optional[str]:
         op = expr.operator
         if left and right:
             return f'{left} {op} {right}'
-    # Add more expression types
+
     return None
 
 def detect_tick_method(java_code: str) -> Optional[Tuple[str, str]]:
-    """Detect and extract tick/server tick logic from Java code."""
     if not JAVALANG_AVAILABLE:
         return None
     try:
@@ -508,7 +509,7 @@ def detect_tick_method(java_code: str) -> Optional[Tuple[str, str]]:
         for _, node in tree:
             if isinstance(node, javalang.tree.MethodDeclaration):
                 if node.name in ('onTick', 'tick', 'serverTick', 'update', 'doUpdate'):
-                    # Extract method body
+
                     method_body = []
                     for stmt in node.body:
                         method_body.extend(translate_statement(stmt, 'this', 'namespace'))
@@ -518,7 +519,6 @@ def detect_tick_method(java_code: str) -> Optional[Tuple[str, str]]:
     return None
 
 def generate_tick_handler_js(namespace: str, entity_id: str, tick_logic: str) -> list:
-    """Generate Bedrock tick handler from Java tick logic."""
     lines = [
         f"world.afterEvents.entitySpawn.subscribe((e) => {{",
         f"    if (!e.entity.typeId.includes('{namespace}:{entity_id}')) return;",
@@ -530,60 +530,211 @@ def generate_tick_handler_js(namespace: str, entity_id: str, tick_logic: str) ->
     ]
     return lines
 class JavaSymbolTable:
-    """Maintains type information for Java classes and variables during translation."""
+
+
+    JAVA_TYPE_TO_BEDROCK: Dict[str, str] = {
+        'Player': 'Player', 'ServerPlayer': 'Player', 'LocalPlayer': 'Player',
+        'Entity': 'Entity', 'LivingEntity': 'Entity', 'Mob': 'Entity',
+        'PathfinderMob': 'Entity', 'Animal': 'Entity', 'Monster': 'Entity',
+        'ItemStack': 'ItemStack', 'Item': 'ItemTypeStr',
+        'BlockPos': 'Vector3', 'Vec3': 'Vector3', 'Vector3f': 'Vector3', 'Vec3i': 'Vector3',
+        'BlockState': 'BlockPermutation',
+        'Level': 'Dimension', 'ServerLevel': 'Dimension', 'World': 'Dimension',
+        'Container': 'Container', 'Inventory': 'Container', 'SimpleContainer': 'Container',
+        'AABB': 'BlockVolume', 'AxisAlignedBB': 'BlockVolume',
+        'CompoundTag': 'DynamicProperties', 'CompoundNBT': 'DynamicProperties',
+        'ListTag': 'DynamicArray', 'ResourceLocation': 'string',
+        'int': 'number', 'float': 'number', 'double': 'number',
+        'long': 'number', 'short': 'number', 'byte': 'number',
+        'boolean': 'boolean', 'String': 'string', 'void': 'void',
+    }
+
+
+    TYPE_METHOD_MAP: Dict[str, Dict[str, str]] = {
+        'Player': {
+            'sendMessage':        '{0}.sendMessage({1})',
+            'getHealth':          '{0}.getComponent("minecraft:health").currentValue',
+            'setHealth':          '{0}.getComponent("minecraft:health").setCurrentValue({1})',
+            'getMaxHealth':       '{0}.getComponent("minecraft:health").maxValue',
+            'getInventory':       '{0}.getComponent("minecraft:inventory").container',
+            'addItem':            '{0}.getComponent("minecraft:inventory").container.addItem({1})',
+            'removeItem':         '{0}.getComponent("minecraft:inventory").container.removeItem({1})',
+            'getLevel':           '{0}.dimension',
+            'getPosition':        '{0}.location',
+            'setPosition':        '{0}.teleport({1})',
+            'isCreative':         '({0}.gameMode === GameMode.creative)',
+            'isSpectator':        '({0}.gameMode === GameMode.spectator)',
+            'isSprinting':        '{0}.isSprinting',
+            'isOnGround':         '{0}.isOnGround',
+            'getExperiencePoints': '{0}.getTotalXp()',
+            'addExperiencePoints': '{0}.addExperience({1})',
+            'hurt':               '{0}.applyDamage({1})',
+            'heal':               '{0}.getComponent("minecraft:health").setCurrentValue({0}.getComponent("minecraft:health").currentValue + {1})',
+            'getEffect':          '{0}.getEffect("{1}")',
+            'addEffect':          '{0}.addEffect("{1}", {2}, {{ duration: {3} }})',
+            'removeEffect':       '{0}.removeEffect("{1}")',
+            'getName':            '{0}.nameTag',
+        },
+        'Entity': {
+            'getHealth':    '{0}.getComponent("minecraft:health").currentValue',
+            'setHealth':    '{0}.getComponent("minecraft:health").setCurrentValue({1})',
+            'getMaxHealth': '{0}.getComponent("minecraft:health").maxValue',
+            'getPosition':  '{0}.location',
+            'setPosition':  '{0}.teleport({1})',
+            'getVelocity':  '{0}.getVelocity()',
+            'setVelocity':  '{0}.applyImpulse({1})',
+            'kill':         '{0}.kill()',
+            'remove':       '{0}.remove()',
+            'hurt':         '{0}.applyDamage({1})',
+            'isAlive':      '(!{0}.isRemoved())',
+            'getType':      '{0}.typeId',
+            'getTags':      '{0}.getTags()',
+            'hasTag':       '{0}.hasTag({1})',
+            'addTag':       '{0}.addTag({1})',
+            'removeTag':    '{0}.removeTag({1})',
+            'getLevel':     '{0}.dimension',
+            'getCustomName':'{ 0}.nameTag',
+            'setCustomName':'{0}.nameTag = {1}',
+        },
+        'ItemStack': {
+            'getCount':       '{0}.amount',
+            'setCount':       '{0}.amount = {1}',
+            'grow':           '{0}.amount += {1}',
+            'shrink':         '{0}.amount -= {1}',
+            'isEmpty':        '({0}.amount <= 0)',
+            'getItem':        '{0}.typeId',
+            'getMaxStackSize':'{0}.maxAmount',
+            'copy':           'new ItemStack({0}.typeId, {0}.amount)',
+            'getDamageValue': '{0}.getComponent("minecraft:durability").damage',
+            'setDamageValue': '{0}.getComponent("minecraft:durability").damage = {1}',
+            'getDisplayName': '({0}.nameTag ?? {0}.typeId)',
+            'setCustomName':  '{0}.nameTag = {1}',
+        },
+        'Dimension': {
+            'setBlockState':       '{0}.getBlock({1}).setPermutation({2})',
+            'getBlockState':       '{0}.getBlock({1}).permutation',
+            'getBlockEntity':      '{0}.getBlock({1})',
+            'addParticle':         '{0}.spawnParticle({1}, {2})',
+            'playSound':           '{0}.playSound("{1}", {2})',
+            'getEntitiesOfClass':  '[...{0}.getEntities({{ type: "{1}" }})]',
+            'getClosestPlayer':    '{0}.getPlayers()[0]',
+        },
+        'DynamicProperties': {
+            'getInt':     '({0}.getDynamicProperty({1}) ?? 0)',
+            'putInt':     '{0}.setDynamicProperty({1}, {2})',
+            'getFloat':   '({0}.getDynamicProperty({1}) ?? 0.0)',
+            'putFloat':   '{0}.setDynamicProperty({1}, {2})',
+            'getBoolean': '({0}.getDynamicProperty({1}) ?? false)',
+            'putBoolean': '{0}.setDynamicProperty({1}, {2})',
+            'getString':  '({0}.getDynamicProperty({1}) ?? "")',
+            'putString':  '{0}.setDynamicProperty({1}, {2})',
+            'hasKey':     '({0}.getDynamicProperty({1}) !== undefined)',
+            'contains':   '({0}.getDynamicProperty({1}) !== undefined)',
+            'remove':     '{0}.setDynamicProperty({1}, undefined)',
+            'getCompound':'JSON.parse({0}.getDynamicProperty({1}) ?? "{{}}")',
+            'put':        '{0}.setDynamicProperty({1}, JSON.stringify({2}))',
+        },
+        'Container': {
+            'getItem':          '{0}.getItem({1})',
+            'setItem':          '{0}.setItem({1}, {2})',
+            'getContainerSize': '{0}.size',
+            'addItem':          '{0}.addItem({1})',
+        },
+        'Vector3': {
+            'add':        '{{ x: {0}.x+{1}.x, y: {0}.y+{1}.y, z: {0}.z+{1}.z }}',
+            'subtract':   '{{ x: {0}.x-{1}.x, y: {0}.y-{1}.y, z: {0}.z-{1}.z }}',
+            'scale':      '{{ x: {0}.x*{1}, y: {0}.y*{1}, z: {0}.z*{1} }}',
+            'length':     'Math.sqrt({0}.x**2+{0}.y**2+{0}.z**2)',
+            'distanceTo': 'Math.sqrt(({0}.x-{1}.x)**2+({0}.y-{1}.y)**2+({0}.z-{1}.z)**2)',
+        },
+    }
+
+    _CAP_ENERGY    = {'receiveEnergy','extractEnergy','getEnergyStored','getMaxEnergyStored','canReceive','canExtract'}
+    _CAP_FLUID     = {'fill','drain','getFluidAmount','getTankCapacity','getFluidInTank','getTanks','isFluidValid'}
+    _CAP_ITEM_HDL  = {'insertItem','extractItem','getStackInSlot','getSlots','isItemValid','getSlotLimit'}
+    _CAP_ITEMSTACK = {'getCount','setCount','grow','shrink','isEmpty'}
+
     def __init__(self):
-        self.classes: Dict[str, Dict] = {}  # class name -> {methods, fields, superclass, interfaces}
-        self.variables: Dict[str, str] = {}  # var name -> type name
-        self.method_return_types: Dict[str, str] = {}  # method name -> return type
-    
+        self.classes: Dict[str, Dict] = {}
+        self.variables: Dict[str, str] = {}
+        self.method_return_types: Dict[str, str] = {}
+        self._qualifier_type_cache: Dict[str, str] = {}
+
     def register_class(self, class_name: str, superclass: Optional[str] = None, interfaces: List[str] = None):
-        """Register a class with its hierarchy."""
         self.classes[class_name] = {
             'superclass': superclass,
             'interfaces': interfaces or [],
             'methods': {},
             'fields': {}
         }
-    
+
     def register_method(self, class_name: str, method_name: str, return_type: str, params: Dict[str, str]):
-        """Register a method with its signature."""
         if class_name in self.classes:
             self.classes[class_name]['methods'][method_name] = {
                 'return': return_type,
                 'params': params
             }
-    
+
     def register_field(self, class_name: str, field_name: str, field_type: str):
-        """Register a field with its type."""
         if class_name in self.classes:
             self.classes[class_name]['fields'][field_name] = field_type
-    
+
     def set_variable_type(self, var_name: str, var_type: str):
-        """Set the type of a variable in current scope."""
         self.variables[var_name] = var_type
-    
+
     def get_variable_type(self, var_name: str) -> Optional[str]:
-        """Get the type of a variable."""
         return self.variables.get(var_name)
-    
-    def method_belongs_to_capability(self, method_name: str) -> Optional[str]:
-        """Determine if a method belongs to a Forge Capability (Energy, Fluid, etc)."""
-        energy_methods = {'receiveEnergy', 'extractEnergy', 'getEnergyStored', 'getMaxEnergyStored'}
-        fluid_methods = {'fill', 'drain', 'getFluidAmount', 'getTankCapacity'}
-        item_methods = {'getCount', 'setCount', 'grow', 'shrink', 'isEmpty'}
-        
-        if method_name in energy_methods:
-            return 'energy'
-        elif method_name in fluid_methods:
-            return 'fluid'
-        elif method_name in item_methods:
-            return 'itemstack'
+
+    def set_variable_type(self, var_name: str, var_type: str):
+        self.variables[var_name] = var_type
+        self._qualifier_type_cache[var_name] = self._resolve_bedrock_type(var_type)
+
+    def get_variable_type(self, var_name: str) -> Optional[str]:
+        return self.variables.get(var_name)
+
+    def _resolve_bedrock_type(self, java_type: str) -> Optional[str]:
+        base = re.sub(r'<.*>', '', java_type).strip()
+        return self.JAVA_TYPE_TO_BEDROCK.get(base)
+
+    def get_bedrock_type_for_var(self, var_name: str) -> Optional[str]:
+        if var_name in self._qualifier_type_cache:
+            return self._qualifier_type_cache[var_name]
+        lower = var_name.lower()
+        if lower in ('player', 'p', 'serverplayer', 'localplayer'): return 'Player'
+        if lower in ('entity', 'mob', 'e', 'target', 'attacker', 'victim'): return 'Entity'
+        if lower in ('stack', 'itemstack', 'item', 'helditem', 'mainhand', 'offhand'): return 'ItemStack'
+        if lower in ('level', 'world', 'dimension', 'serverlevel', 'dim'): return 'Dimension'
+        if lower in ('nbt', 'tag', 'compound', 'data', 'persistentdata'): return 'DynamicProperties'
+        if lower in ('pos', 'blockpos', 'position', 'origin', 'loc', 'location'): return 'Vector3'
+        if lower in ('inventory', 'container', 'inv', 'chest', 'slots'): return 'Container'
         return None
-    
+
+    def resolve_method_call(self, qualifier: str, method: str, args: List[str]) -> Optional[str]:
+        btype = self.get_bedrock_type_for_var(qualifier)
+        if not btype:
+            return None
+        template = self.TYPE_METHOD_MAP.get(btype, {}).get(method)
+        if template is None:
+            return None
+        result = template.replace('{0}', qualifier)
+        for i, arg in enumerate(args):
+            result = result.replace(f'{{{i + 1}}}', arg)
+        return result
+
+    def method_belongs_to_capability(self, method_name: str) -> Optional[str]:
+        if method_name in self._CAP_ENERGY:    return 'energy'
+        if method_name in self._CAP_FLUID:     return 'fluid'
+        if method_name in self._CAP_ITEM_HDL:  return 'item_handler'
+        if method_name in self._CAP_ITEMSTACK: return 'itemstack'
+        return None
+
     def scan_java_file(self, java_code: str):
-        """Pre-scan a Java file to build symbol table."""
-        if not JAVALANG_AVAILABLE:
-            return
+        if JAVALANG_AVAILABLE:
+            self._scan_ast(java_code)
+        else:
+            self._scan_regex(java_code)
+
+    def _scan_ast(self, java_code: str):
         try:
             tree = javalang.parse.parse(java_code)
             for _, node in tree:
@@ -591,61 +742,174 @@ class JavaSymbolTable:
                     superclass = node.extends.name if node.extends else None
                     interfaces = [i.name for i in (node.implements or [])]
                     self.register_class(node.name, superclass, interfaces)
-                    
-                    # Register methods
                     for method in node.methods:
                         ret_type = method.return_type.name if method.return_type else 'void'
-                        params = {p.name: p.type.name for p in (method.parameters or [])}
+                        params = {}
+                        for p in (method.parameters or []):
+                            ptype = p.type.name if hasattr(p.type, 'name') else str(p.type)
+                            params[p.name] = ptype
+                            self.set_variable_type(p.name, ptype)
                         self.register_method(node.name, method.name, ret_type, params)
-                    
-                    # Register fields
                     for field in node.fields:
-                        field_type = field.type.name if hasattr(field.type, 'name') else str(field.type)
+                        ftype = field.type.name if hasattr(field.type, 'name') else str(field.type)
                         for decl in field.declarators:
-                            self.register_field(node.name, decl.name, field_type)
+                            self.register_field(node.name, decl.name, ftype)
+                            self.set_variable_type(decl.name, ftype)
+                elif isinstance(node, javalang.tree.LocalVariableDeclaration):
+                    ltype = node.type.name if hasattr(node.type, 'name') else str(node.type)
+                    for decl in node.declarators:
+                        self.set_variable_type(decl.name, ltype)
         except Exception:
             pass
 
+    def _scan_regex(self, java_code: str):
+        for m in re.finditer(r'class\s+(\w+)(?:\s+extends\s+(\w+))?', java_code):
+            self.register_class(m.group(1), m.group(2))
+        for m in re.finditer(
+            r'(?:private|protected|public|final|static)\s+(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*[=;]',
+            java_code
+        ):
+            self.set_variable_type(m.group(2), m.group(1))
+        for m in re.finditer(r'(?:void|\w+)\s+\w+\s*\(([^)]+)\)', java_code):
+            for param in m.group(1).split(','):
+                parts = param.strip().split()
+                if len(parts) >= 2:
+                    self.set_variable_type(parts[-1].strip(), parts[-2].strip())
+
 class MoLangBridge:
-    """Convert Java mathematical expressions into MoLang for Bedrock animations."""
-    
+
+
+    _FUNC_MAP = [
+        (r'Math\.sin\(', 'math.sin('),
+        (r'Math\.cos\(', 'math.cos('),
+        (r'Math\.tan\(', 'math.tan('),
+        (r'Math\.asin\(', 'math.asin('),
+        (r'Math\.acos\(', 'math.acos('),
+        (r'Math\.atan2?\(', 'math.atan('),
+        (r'Math\.sqrt\(', 'math.sqrt('),
+        (r'Math\.abs\(', 'math.abs('),
+        (r'Math\.floor\(', 'math.floor('),
+        (r'Math\.ceil\(', 'math.ceil('),
+        (r'Math\.round\(', 'math.round('),
+        (r'Math\.min\(', 'math.min('),
+        (r'Math\.max\(', 'math.max('),
+        (r'Math\.clamp\(', 'math.clamp('),
+        (r'Math\.pow\(([^,]+),\s*2\)', r'(\1 * \1)'),                        
+        (r'Math\.pow\(([^,]+),\s*([^)]+)\)', r'math.pow(\1, \2)'),
+        (r'Math\.PI', '3.14159265'),
+        (r'Math\.toRadians\(([^)]+)\)', r'(\1 * 0.01745329)'),
+        (r'Math\.toDegrees\(([^)]+)\)', r'(\1 * 57.2957795)'),
+        (r'Math\.random\(\)', 'math.random(0, 1)'),
+        (r'Math\.lerp\(([^,]+),\s*([^,]+),\s*([^)]+)\)', r'math.lerp(\1, \2, \3)'),
+    ]
+
+
+    _VAR_MAP = [
+        (r'\bentity\.tickCount\b',           'query.anim_time * 20'),
+        (r'\bthis\.tickCount\b',              'query.anim_time * 20'),
+        (r'\btickCount\b',                     'query.anim_time * 20'),
+        (r'\banimationTick\b',                 'query.anim_time * 20'),
+        (r'\bpartialTick\b',                   'query.anim_time'),
+        (r'\bentity\.isInWater\(\)\b',     'query.is_in_water'),
+        (r'\bentity\.isOnGround\(\)\b',    'query.is_on_ground'),
+        (r'\bentity\.isSprinting\(\)\b',   'query.is_sprinting'),
+        (r'\bentity\.isSneaking\(\)\b',    'query.is_sneaking'),
+        (r'\bentity\.isSwimming\(\)\b',    'query.is_swimming'),
+        (r'\bentity\.isBaby\(\)\b',        'query.is_baby'),
+        (r'\bentity\.isOnFire\(\)\b',      'query.is_on_fire'),
+        (r'\bentity\.getHealth\(\)',         'query.health'),
+        (r'\bentity\.getSpeed\(\)',          'query.ground_speed'),
+        (r'\bentity\.xRot\b',                'query.body_x_rotation'),
+        (r'\bentity\.yRot\b',                'query.body_y_rotation'),
+        (r'\bthis\.(\w+)\b',                r'variable.\1'),
+    ]
+
+
+    _TERNARY_RE = re.compile(
+        r'([^?]+)\?\s*([^:]+):\s*(.+)'
+    )
+
     @staticmethod
     def java_to_molang(java_expr: str) -> str:
-        """Translate Java expressions to MoLang."""
-        # Replace common Java patterns
-        molang = java_expr.replace('Math.sin', 'math.sin')
-        molang = molang.replace('Math.cos', 'math.cos')
-        molang = molang.replace('Math.sqrt', 'math.sqrt')
-        molang = molang.replace('Math.abs', 'math.abs')
-        molang = molang.replace('Math.floor', 'math.floor')
-        molang = molang.replace('Math.ceil', 'math.ceil')
-        # Replace variable references with query calls
-        molang = re.sub(r'\bthis\.(\w+)\b', r'variable.\1', molang)
-        molang = re.sub(r'\breturn\s+', '', molang)
-        return molang
+        m = java_expr.strip()
 
-# ============================================================================
-# ANIMATION CONTROLLER GENERATOR
-# ============================================================================
+        m = re.sub(r'\((?:float|double|int|long)\)\s*', '', m)
+
+        m = re.sub(r'^return\s+', '', m.strip())
+        m = m.rstrip(';')
+
+        tern = MoLangBridge._TERNARY_RE.match(m)
+        if tern:
+            cond = MoLangBridge.java_to_molang(tern.group(1).strip())
+            t_val = MoLangBridge.java_to_molang(tern.group(2).strip())
+            f_val = MoLangBridge.java_to_molang(tern.group(3).strip())
+            return f'({cond} ? {t_val} : {f_val})'
+
+        for pattern, replacement in MoLangBridge._FUNC_MAP:
+            m = re.sub(pattern, replacement, m)
+
+        for pattern, replacement in MoLangBridge._VAR_MAP:
+            m = re.sub(pattern, replacement, m)
+
+        m = re.sub(r'(\d+\.?\d*)f\b', r'\1', m)
+
+        while '((' in m and '))' in m:
+            m = re.sub(r'\(\(([^()]+)\)\)', r'(\1)', m)
+        return m.strip()
+
+    @staticmethod
+    def build_animation_json_entry(bone: str, channel: str,
+                                   java_expr: str, namespace: str) -> dict:
+        molang = MoLangBridge.java_to_molang(java_expr)
+        entry = {
+            "0.0": {
+                channel: [molang, "0.0", "0.0"]
+                if channel != 'rotation' else [molang, "0.0", "0.0"]
+            }
+        }
+        return entry
+
+    @staticmethod
+    def inject_molang_into_anim_file(anim_path: str, entity_name: str,
+                                     bone_channel_map: Dict[str, Dict[str, str]]) -> None:
+        if not os.path.exists(anim_path):
+            return
+        try:
+            with open(anim_path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+        except Exception:
+            return
+        animations = data.get('animations', {})
+        for anim_id, anim_body in animations.items():
+            if entity_name not in anim_id:
+                continue
+            bones = anim_body.setdefault('bones', {})
+            for bone, channels in bone_channel_map.items():
+                bone_entry = bones.setdefault(bone, {})
+                for ch, java_expr in channels.items():
+                    molang = MoLangBridge.java_to_molang(java_expr)
+                    bone_entry[ch] = molang
+        with open(anim_path, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+
+
 class AnimationControllerGenerator:
-    """Generate Bedrock animation_controllers.json from Java state machine logic."""
-    
+
     @staticmethod
     def generate_default_controller(entity_name: str, animations: Dict[str, str]) -> dict:
-        """Generate a basic animation controller with state transitions."""
         controller_name = f"controller.animation.{entity_name}.default"
         states = {
             "default": {
-                "animations": list(animations.keys())[:1],  # Play first animation
+                "animations": list(animations.keys())[:1],                        
             }
         }
-        # Add simple state transitions based on common conditions
+
         for anim_name in list(animations.keys())[1:]:
             states[anim_name] = {
                 "animations": [anim_name],
                 "transitions": [{"default": "!variable.playing_" + anim_name}]
             }
-        
+
         return {
             "format_version": "1.10.0",
             "animation_controllers": {
@@ -655,28 +919,195 @@ class AnimationControllerGenerator:
             }
         }
 
-# ============================================================================
-# NBT TRANSLATOR: Map Java NBT operations to Bedrock dynamic properties
-# ============================================================================
+
 class NBTTranslator:
-    """Translate Java NBT read/write to Bedrock getDynamicProperty/setDynamicProperty."""
-    
+
     NBT_TO_BEDROCK_MAP = {
         'readAdditionalSaveData': 'getDynamicProperty',
-        'addAdditionalSaveData': 'setDynamicProperty',
-        'getInt': 'getDynamicProperty',
-        'putInt': 'setDynamicProperty',
-        'getString': 'getDynamicProperty',
-        'putString': 'setDynamicProperty',
-        'getFloat': 'getDynamicProperty',
-        'putFloat': 'setDynamicProperty',
-        'getBoolean': 'getDynamicProperty',
-        'putBoolean': 'setDynamicProperty',
+        'addAdditionalSaveData':  'setDynamicProperty',
+        'getInt':    'getDynamicProperty', 'putInt':    'setDynamicProperty',
+        'getString': 'getDynamicProperty', 'putString': 'setDynamicProperty',
+        'getFloat':  'getDynamicProperty', 'putFloat':  'setDynamicProperty',
+        'getBoolean':'getDynamicProperty', 'putBoolean':'setDynamicProperty',
+        'getDouble': 'getDynamicProperty', 'putDouble': 'setDynamicProperty',
+        'getLong':   'getDynamicProperty', 'putLong':   'setDynamicProperty',
+        'getByte':   'getDynamicProperty', 'putByte':   'setDynamicProperty',
+        'getList':   'getDynamicProperty', 'put':       'setDynamicProperty',
+        'getCompound': 'getDynamicProperty',
     }
-    
+
+
+    _TYPE_HINTS = {
+        'getInt': 'number', 'getFloat': 'number', 'getDouble': 'number',
+        'getLong': 'number', 'getByte': 'number', 'getShort': 'number',
+        'getString': 'string', 'getBoolean': 'boolean',
+        'getList': 'array',   'getCompound': 'object',
+    }
+
+    @staticmethod
+    def translate_nbt_call(method: str, args, namespace: str,
+                           entity_var: str = 'entity') -> Optional[str]:
+        bedrock = NBTTranslator.NBT_TO_BEDROCK_MAP.get(method)
+        if bedrock is None:
+            return None
+        if not args:
+            return None
+
+        key_arg = None
+        if JAVALANG_AVAILABLE:
+            first = args[0]
+            if isinstance(first, javalang.tree.Literal) and first.value.startswith('"'):
+                key_arg = first.value.strip('"')
+        if key_arg is None:
+
+            m = re.search(r'"([^"]+)"', str(args))
+            key_arg = m.group(1) if m else 'unknown'
+        prop_key = f'"{namespace}:{key_arg}"'
+        type_hint = NBTTranslator._TYPE_HINTS.get(method, 'any')
+        default = {'number': 0, 'string': '""""', 'boolean': 'false',
+                   'array': '[]', 'object': '{}'}.get(type_hint, 'null')
+        if method.startswith('get') or method == 'readAdditionalSaveData':
+            return f'    ({entity_var}.getDynamicProperty({prop_key}) ?? {default})'
+        elif method.startswith('put') or method == 'addAdditionalSaveData':
+            val_arg = 'value'
+            if len(args) > 1 and JAVALANG_AVAILABLE:
+                lit = args[1]
+                if isinstance(lit, javalang.tree.Literal):
+                    val_arg = lit.value
+            return f'    {entity_var}.setDynamicProperty({prop_key}, {val_arg});'
+        return None
+
+
+class RecursiveNBTSerializer:
+
+
+    _MAX_VALUE_LEN = 32_000
+
+    @staticmethod
+    def flatten(nbt: dict, prefix: str = '', depth: int = 0,
+                _out: Optional[list] = None) -> list:
+        if _out is None:
+            _out = []
+        if depth > 16:
+
+            _out.append((prefix, json.dumps(nbt)[:RecursiveNBTSerializer._MAX_VALUE_LEN]))
+            return _out
+        for k, v in nbt.items():
+            path = f'{prefix}.{k}' if prefix else k
+            if isinstance(v, dict):
+                RecursiveNBTSerializer.flatten(v, path, depth + 1, _out)
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    item_path = f'{path}.{i}'
+                    if isinstance(item, dict):
+                        RecursiveNBTSerializer.flatten(item, item_path, depth + 1, _out)
+                    else:
+                        _out.append((item_path, item))
+            else:
+
+                _out.append((path, v))
+        return _out
+
+    @staticmethod
+    def emit_set_js(nbt: dict, namespace: str, entity_var: str = 'entity') -> list:
+        lines = [f'// NBT serialization — {len(nbt)} top-level keys']
+        pairs = RecursiveNBTSerializer.flatten(nbt)
+        for dot_path, value in pairs:
+            prop_key = f'{namespace}:{dot_path}'
+            if isinstance(value, str):
+                js_val = json.dumps(value)
+            elif isinstance(value, bool):
+                js_val = 'true' if value else 'false'
+            elif value is None:
+                js_val = 'null'
+            else:
+                js_val = str(value)
+            if len(js_val) > RecursiveNBTSerializer._MAX_VALUE_LEN:
+                js_val = json.dumps(js_val[:RecursiveNBTSerializer._MAX_VALUE_LEN])
+            lines.append(f'{entity_var}.setDynamicProperty("{prop_key}", {js_val});')
+        return lines
+
+    @staticmethod
+    def reconstruct_js(dot_paths: list, namespace: str,
+                       entity_var: str = 'entity',
+                       out_var: str = 'nbt') -> list:
+        lines = [
+            f'const {out_var} = {{}};',
+            f'const _set = (obj, path, val) => {{',
+            f'    const parts = path.split(".");',
+            f'    let cur = obj;',
+            f'    for (let i = 0; i < parts.length - 1; i++) {{',
+            f'        const k = isNaN(parts[i]) ? parts[i] : +parts[i];',
+            f'        if (cur[k] === undefined) cur[k] = isNaN(parts[i+1]) ? {{}} : [];',
+            f'        cur = cur[k];',
+            f'    }}',
+            f'    cur[parts[parts.length-1]] = val;',
+            f'}};',
+        ]
+        for path in dot_paths:
+            prop_key = f'{namespace}:{path}'
+            lines.append(
+                f'_set({out_var}, "{path}", {entity_var}.getDynamicProperty("{prop_key}"));')
+        lines.append(f'// {out_var} is now the reconstructed nested object')
+        return lines
+
+    @staticmethod
+    def scan_and_emit_nbt_scripts(java_code: str, entity_id: str,
+                                   namespace: str, bp_folder: str) -> None:
+        safe = sanitize_identifier(entity_id.split(':')[-1])
+        write_calls: list = []
+        read_calls:  list = []
+
+
+        save_body = _extract_method_body(java_code, 'addAdditionalSaveData')
+        if save_body:
+            for m in re.finditer(
+                r'(?:tag|nbt|compound)\.(put\w+)\s*\(\s*"([^"]+)"\s*,\s*([^;)]+)',
+                save_body
+            ):
+                method, key, val = m.group(1), m.group(2), m.group(3).strip()
+                prop = f'{namespace}:{safe}.{key}'
+                write_calls.append(f'entity.setDynamicProperty("{prop}", {val});')
+
+
+        load_body = _extract_method_body(java_code, 'readAdditionalSaveData')
+        if load_body:
+            for m in re.finditer(
+                r'(?:tag|nbt|compound)\.(get\w+)\s*\(\s*"([^"]+)"\)',
+                load_body
+            ):
+                method, key = m.group(1), m.group(2)
+                prop = f'{namespace}:{safe}.{key}'
+                default = {'getInt':'0','getFloat':'0','getDouble':'0',
+                           'getString':'\'\'','getBoolean':'false','getLong':'0'}.get(method, 'null')
+                read_calls.append(
+                    f'const {key} = entity.getDynamicProperty("{prop}") ?? {default};')
+
+        if not write_calls and not read_calls:
+            return
+
+        lines = [
+            f'import {{ world }} from "@minecraft/server";',
+            '',
+            f'// Auto-generated NBT serializer for {entity_id}',
+            f'export function saveNBT_{safe}(entity) {{',
+        ] + [f'    {l}' for l in write_calls] + [
+            '}',
+            '',
+            f'export function loadNBT_{safe}(entity) {{',
+        ] + [f'    {l}' for l in read_calls] + [
+            '}',
+            '',
+        ]
+        out_path = os.path.join(bp_folder, 'scripts', f'{safe}_nbt.js')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(lines))
+        print(f'[nbt] Wrote {out_path}')
+
+
 class CapabilityRegistry:
-    """Maps Forge Capabilities to Bedrock Dynamic Properties and JS Managers."""
-    
+
     CAPABILITY_TYPES = {
         'IEnergyStorage': {
             'properties': ['energy_stored', 'max_energy'],
@@ -694,30 +1125,29 @@ class CapabilityRegistry:
             'bedrock_type': 'itemstack',
         },
     }
-    
+
     @staticmethod
     def generate_capability_manager(capability_type: str, namespace: str, entity_id: str) -> list:
-        """Generate JS manager functions for a Forge capability."""
         lines = [
             'import { ItemStack } from "@minecraft/server";',
             "",
         ]
-        
+
         if capability_type not in CapabilityRegistry.CAPABILITY_TYPES:
             return lines
-        
+
         cap = CapabilityRegistry.CAPABILITY_TYPES[capability_type]
-        
+
         lines.append(f"// {capability_type} Manager for {entity_id}")
         lines.append(f"const {entity_id}_capabilities = {{")
-        
+
         for prop in cap['properties']:
             lines.append(f"    {prop}: 0,")
-        
+
         lines.append(f"}};")
         lines.append("")
-        
-        # Generate accessor methods
+
+
         for method in cap['methods']:
             if method.startswith('get'):
                 prop_name = method[3:].lower()
@@ -739,78 +1169,160 @@ class CapabilityRegistry:
                 lines.append(f'    entity.setDynamicProperty("{namespace}:{entity_id}_stored", current - extracted);')
                 lines.append(f"    return extracted;")
                 lines.append(f"}}")
-        
+
         lines.append("")
         return lines
 
 class EventRouter:
-    """Maps Forge @SubscribeEvent handlers to Bedrock world.afterEvents."""
-    
-    FORGE_TO_BEDROCK = {
-        'LivingHurtEvent': ('entityHurt', 'entity'),
-        'LivingDeathEvent': ('entityDie', 'entity'),
-        'PlayerInteractEvent.RightClickEntity': ('playerInteractWithEntity', 'player'),
-        'PlayerInteractEvent.RightClickBlock': ('playerPlaceBlock', 'player'),
-        'BlockEvent.BreakEvent': ('playerBreakBlock', 'player'),
-        'BlockEvent.PlaceEvent': ('playerPlaceBlock', 'player'),
-        'TickEvent.ServerTickEvent': ('worldInitialize', None),  # Special: runs custom tick loop
-        'TickEvent.ClientTickEvent': ('tick', None),  # Per-entity tick
-        'ItemPickupEvent': ('entityPickUpItem', 'entity'),
-        'EntityJoinWorldEvent': ('entitySpawn', 'entity'),
-        'EntityLeaveWorldEvent': ('entityRemove', 'entity'),
-        'PlayerLoggedInEvent': ('playerJoin', 'player'),
-        'PlayerLoggedOutEvent': ('playerLeave', 'player'),
+
+
+    FORGE_TO_BEDROCK: Dict[str, tuple] = {
+
+        'LivingHurtEvent':                      ('entityHurt',                 'entity',  False),
+        'LivingDamageEvent':                    ('entityHurt',                 'entity',  False),
+        'LivingDeathEvent':                     ('entityDie',                  'entity',  False),
+        'LivingKnockBackEvent':                 ('entityHurt',                 'entity',  True),
+
+        'PlayerInteractEvent.RightClickEntity': ('playerInteractWithEntity',   'player',  True),
+        'PlayerInteractEvent.RightClickBlock':  ('playerPlaceBlock',           'player',  True),
+        'PlayerInteractEvent.LeftClickBlock':   ('playerBreakBlock',           'player',  True),
+        'PlayerInteractEvent.LeftClickEmpty':   ('playerBreakBlock',           'player',  False),
+
+        'BlockEvent.BreakEvent':                ('playerBreakBlock',           'player',  True),
+        'BlockEvent.PlaceEvent':                ('playerPlaceBlock',           'player',  True),
+        'BlockEvent.EntityPlaceEvent':          ('playerPlaceBlock',           'entity',  True),
+        'BlockEvent.EntityMultiPlaceEvent':     ('playerPlaceBlock',           'entity',  True),
+
+        'ItemPickupEvent':                      ('entityPickUpItem',           'entity',  False),
+        'ItemTossEvent':                        ('entityDropItem',             'entity',  True),
+        'AnvilRepairEvent':                     ('playerInteractWithEntity',   'player',  False),
+        'PlayerDestroyItemEvent':               ('playerBreakBlock',           'player',  False),
+
+        'EntityJoinWorldEvent':                 ('entitySpawn',                'entity',  False),
+        'EntityJoinLevelEvent':                 ('entitySpawn',                'entity',  False),
+        'EntityLeaveWorldEvent':                ('entityRemove',               'entity',  False),
+        'EntityLeaveLevelEvent':                ('entityRemove',               'entity',  False),
+        'EntityTeleportEvent':                  ('entityHitBlock',             'entity',  True),
+        'EntityMountEvent':                     ('playerInteractWithEntity',   'player',  True),
+
+        'PlayerLoggedInEvent':                  ('playerJoin',                 'player',  False),
+        'PlayerLoggedOutEvent':                 ('playerLeave',                'player',  False),
+        'PlayerChangedDimensionEvent':          ('playerDimensionChange',      'player',  False),
+        'PlayerRespawnEvent':                   ('playerSpawn',                'player',  False),
+
+        'TickEvent.ServerTickEvent':            ('worldInitialize',            None,      False),
+        'TickEvent.ClientTickEvent':            ('tick',                       None,      False),
+        'TickEvent.LevelTickEvent':             ('worldInitialize',            None,      False),
+        'LevelTickEvent':                       ('worldInitialize',            None,      False),
+
+        'ProjectileImpactEvent':                ('projectileHitBlock',         'entity',  False),
+        'ArrowNockEvent':                       ('playerInteractWithEntity',   'player',  True),
+
+        'ServerChatEvent':                      ('chatSend',                   'player',  True),
+        'CommandEvent':                         ('chatSend',                   'player',  False),
+
+        'ExplosionEvent.Detonate':              ('explosion',                  None,      False),
+        'FillBucketEvent':                      ('playerInteractWithBlock',    'player',  True),
     }
-    
+
+
+    _CANCEL_PATTERN = re.compile(
+        r'event\.setCanceled\s*\(\s*true\s*\)|event\.isCanceled\s*\(\s*\)'
+    )
+
     @staticmethod
-    def generate_event_wrapper(forge_event: str, java_logic: str, namespace: str) -> list:
-        """Generate Bedrock event subscription boilerplate."""
-        lines = []
-        
-        if forge_event not in EventRouter.FORGE_TO_BEDROCK:
+    def generate_event_wrapper(forge_event: str, java_logic: str,
+                                namespace: str, symbol_table=None) -> list:
+        lines: list = []
+        mapping = EventRouter.FORGE_TO_BEDROCK.get(forge_event)
+        if mapping is None:
+
+            safe = re.sub(r'[^\w]', '_', forge_event).lower()
+            lines.append(f'// TODO: No Bedrock equivalent for Forge event: {forge_event}')
+            lines.append(f'// Original Java handler body preserved below as reference:')
+            for line in java_logic.splitlines():
+                lines.append(f'//   {line}')
+            lines.append('')
             return lines
-        
-        bedrock_event, entity_param = EventRouter.FORGE_TO_BEDROCK[forge_event]
-        
+
+        bedrock_event, entity_param, use_before = mapping
+        bus = 'beforeEvents' if use_before else 'afterEvents'
+
+
+        if EventRouter._CANCEL_PATTERN.search(java_logic):
+            bus = 'beforeEvents'
+
         if bedrock_event == 'worldInitialize':
-            lines.append(f"world.afterEvents.worldInitialize.subscribe((e) => {{")
+            lines.append(f'world.afterEvents.worldInitialize.subscribe((e) => {{')
         else:
-            lines.append(f"world.afterEvents.{bedrock_event}.subscribe((e) => {{")
+            lines.append(f'world.{bus}.{bedrock_event}.subscribe((e) => {{')
             if entity_param:
-                lines.append(f"    const {entity_param} = e.{entity_param};")
-        
-        lines.append(java_logic)
-        lines.append("}});")
-        lines.append("")
-        
+                lines.append(f'    const {entity_param} = e.{entity_param};')
+
+
+        translated = re.sub(
+            r'event\.setCanceled\s*\(\s*true\s*\)',
+            'e.cancel()',
+            java_logic
+        )
+        lines.append(translated)
+        lines.append('});')
+        lines.append('')
         return lines
 
+    @staticmethod
+    def scan_and_emit_all_handlers(java_code: str, namespace: str,
+                                    safe_name: str, symbol_table=None) -> list:
+        all_lines: list = []
+
+        handler_re = re.compile(
+            r'@SubscribeEvent[\s\S]*?public\s+\w+\s+(\w+)\s*\(\s*(\w+)(?:\.[\w.]+)?\s+\w+\s*\)',
+            re.MULTILINE
+        )
+        for m in handler_re.finditer(java_code):
+            method_name = m.group(1)
+            event_type  = m.group(2)
+
+            body_start = java_code.find('{', m.end())
+            if body_start == -1:
+                continue
+            depth, i = 0, body_start
+            while i < len(java_code):
+                if java_code[i] == '{'  : depth += 1
+                elif java_code[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = java_code[body_start + 1: i].strip()
+            all_lines += EventRouter.generate_event_wrapper(
+                event_type, body, namespace, symbol_table
+            )
+        return all_lines
+
 class MathTranspiler:
-    """Convert Java Vector3d and AxisAlignedBB to Bedrock Vector3 and BlockVolume."""
-    
+
     @staticmethod
     def transpile_vector_op(java_expr: str) -> str:
-        """Convert Java vector operations to Bedrock."""
-        # new Vector3d(x, y, z) → new Vector3(x, y, z)
+
         bedrock = re.sub(r'new Vector3d\(([^,]+),\s*([^,]+),\s*([^)]+)\)', r'new Vector3(\1, \2, \3)', java_expr)
-        # vec.add(other) → { x: vec.x + other.x, y: vec.y + other.y, z: vec.z + other.z }
+
         bedrock = re.sub(r'(\w+)\.add\((\w+)\)', r'{ x: \1.x + \2.x, y: \1.y + \2.y, z: \1.z + \2.z }', bedrock)
-        # vec.subtract(other) → { x: vec.x - other.x, y: vec.y - other.y, z: vec.z - other.z }
+
         bedrock = re.sub(r'(\w+)\.subtract\((\w+)\)', r'{ x: \1.x - \2.x, y: \1.y - \2.y, z: \1.z - \2.z }', bedrock)
-        # vec.scale(factor) → { x: vec.x * factor, y: vec.y * factor, z: vec.z * factor }
+
         bedrock = re.sub(r'(\w+)\.scale\(([^)]+)\)', r'{ x: \1.x * \2, y: \1.y * \2, z: \1.z * \2 }', bedrock)
-        # vec.getX() → vec.x
+
         bedrock = re.sub(r'\.getX\(\)', '.x', bedrock)
         bedrock = re.sub(r'\.getY\(\)', '.y', bedrock)
         bedrock = re.sub(r'\.getZ\(\)', '.z', bedrock)
-        # new AxisAlignedBB(minX, minY, minZ, maxX, maxY, maxZ) → new BlockVolume({ min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } })
+
         bedrock = re.sub(r'new AxisAlignedBB\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', 
                          r'new BlockVolume({ min: { x: \1, y: \2, z: \3 }, max: { x: \4, y: \5, z: \6 } })', bedrock)
         return bedrock
-    
+
     @staticmethod
     def transpile_math_expr(java_expr: str) -> str:
-        """Convert Java Math expressions to Bedrock-compatible JS."""
         bedrock = java_expr.replace('Math.PI', 'Math.PI')
         bedrock = bedrock.replace('Math.sqrt', 'Math.sqrt')
         bedrock = bedrock.replace('Math.pow', 'Math.pow')
@@ -819,20 +1331,17 @@ class MathTranspiler:
         bedrock = re.sub(r'Math\.toDegrees\(([^)]+)\)', r'(\1) * 180 / Math.PI', bedrock)
         return bedrock
 
-# ============================================================================
-# PHASE 2: LOGIC TRANSPILER - Comprehensive Forge → Bedrock Method Mapping
-# ============================================================================
+
 class JavaToBedrockMethodMap:
-    """Canonical method mapping table: Java → Bedrock equivalents."""
-    
+
     STRICT_MAPPING = {
-        # World/Block operations
+
         'world.setBlockState': 'dimension.getBlock({0}).setPermutation({1})',
         'world.getBlockState': 'dimension.getBlock({0}).permutation',
         'world.getBlockEntity': 'dimension.getBlock({0})',
         'level.setBlockState': 'dimension.getBlock({0}).setPermutation({1})',
-        
-        # Entity operations
+
+
         'entity.getHealth': 'entity.getComponent("health").currentValue',
         'entity.setHealth': 'entity.getComponent("health").setCurrentValue({0})',
         'entity.getMaxHealth': 'entity.getComponent("health").maxValue',
@@ -841,75 +1350,65 @@ class JavaToBedrockMethodMap:
         'entity.getVelocity': 'entity.velocity',
         'entity.setVelocity': 'entity.applyImpulse({0})',
         'entity.kill': 'entity.kill()',
-        
-        # Player operations
+
+
         'player.sendMessage': 'player.sendMessage({0})',
         'player.getInventory': 'player.getComponent("minecraft:inventory")',
         'player.addItem': 'player.getComponent("minecraft:inventory").container.addItem({0})',
         'player.removeItem': 'player.getComponent("minecraft:inventory").container.removeItem({0})',
-        
-        # NBT/Data
+
+
         'itemStack.getTag': 'itemStack.getComponent("minecraft:enchantable")',
         'compoundTag.getInt': 'entity.getDynamicProperty({0}) || 0',
         'compoundTag.putInt': 'entity.setDynamicProperty({0}, {1})',
-        
-        # Item operations
+
+
         'new ItemStack': 'new ItemStack({0})',
         'itemStack.getCount': 'itemStack.amount',
         'itemStack.setCount': 'itemStack.amount = {0}',
-        
-        # Particle/Sound
+
+
         'world.addParticle': 'dimension.spawnParticle({0}, {1})',
         'world.playSound': 'dimension.playSound({0}, {1})',
     }
-    
+
     @staticmethod
     def lookup_method(java_method: str) -> Optional[str]:
-        """Look up Bedrock equivalent for Java method."""
         bedrock = JavaToBedrockMethodMap.STRICT_MAPPING.get(java_method)
         if bedrock is None:
             log_critical_failure(f"No Bedrock equivalent for Java method: {java_method}")
         return bedrock
-    
+
     @staticmethod
     def translate_method_call(java_method: str, args: list, qualifier: Optional[str] = None) -> Optional[str]:
-        """Translate a Java method call to Bedrock JS, handling arguments."""
         template = JavaToBedrockMethodMap.lookup_method(java_method)
         if not template:
             return None
-        
-        # Translate args
+
+
         translated_args = [translate_expression(arg) for arg in args]
-        
-        # Replace placeholders like {0}, {1}, etc.
+
+
         for i, arg in enumerate(translated_args):
             template = template.replace(f'{{{i}}}', arg)
-        
-        # Handle specific named placeholders if any
-        # For example, if {pos} and args[0] is pos
-        # But for now, assume positional
-        
+
+
         return template
 
-# ============================================================================
-# PHASE 3: TICK REGISTRY - Central Heartbeat to Prevent Script Watchdog
-# ============================================================================
+
 class TickRegistry:
-    """Central tick manager for all mod entities. Prevents Bedrock script watchdog."""
-    
+
     def __init__(self):
         self.tick_handlers: Dict[str, list] = {}
         self.tick_priority: Dict[str, int] = {}
-    
+
     def register_tick_handler(self, entity_id: str, logic: str, priority: int = 100):
-        """Register an entity's tick logic."""
         if entity_id not in self.tick_handlers:
             self.tick_handlers[entity_id] = []
         self.tick_handlers[entity_id].append(logic)
         self.tick_priority[entity_id] = priority
-    
+
     def generate_central_tick_loop(self, namespace: str) -> list:
-        """Generate the central tick loop that prevents watchdog timeouts."""
         lines = [
             'import { world, system } from "@minecraft/server";',
             "",
@@ -939,47 +1438,43 @@ class TickRegistry:
             "}, 1); // Run every game tick",
             "",
         ]
-        
-        # Register all handlers
+
+
         for entity_id, handlers in self.tick_handlers.items():
             lines.append(f"tick_registry.handlers['{namespace}:{entity_id}'] = (entity) => {{")
             for handler in handlers:
                 lines.extend(handler.split('\n'))
             lines.append("};")
             lines.append("")
-        
+
         return lines
 
-# ============================================================================
-# PHASE 4: COMPONENT UI BRIDGE - Container → ActionFormData
-# ============================================================================
+
 class ComponentUIBridge:
-    """Convert Forge Container/Screen classes to Bedrock Server UI forms."""
-    
+
     @staticmethod
     def detect_container_class(java_code: str) -> Optional[Dict[str, str]]:
-        """Detect Container class definition in Java."""
         if 'class ' not in java_code or 'Container' not in java_code:
             return None
-        
+
         container_info = {
             'class_name': '',
             'slots': [],
             'buttons': [],
             'fields': []
         }
-        
-        # Extract class name
+
+
         match = re.search(r'class\s+(\w+)\s+extends\s+Container', java_code)
         if match:
             container_info['class_name'] = match.group(1)
-        
-        # Extract slot definitions
+
+
         slot_pattern = r'this\.addSlotToContainer\s*\(\s*new\s+Slot\s*\(([^)]+)\)'
         for match in re.finditer(slot_pattern, java_code):
             container_info['slots'].append(match.group(1))
-        
-        # Extract button definitions
+
+
         button_pattern = r'new\s+GuiButton\s*\(\s*(\d+),\s*([^,]+),\s*([^,]+),\s*"([^"]+)"'
         for match in re.finditer(button_pattern, java_code):
             container_info['buttons'].append({
@@ -988,12 +1483,11 @@ class ComponentUIBridge:
                 'y': match.group(3),
                 'label': match.group(4)
             })
-        
+
         return container_info if container_info['class_name'] else None
-    
+
     @staticmethod
     def generate_action_form(container_info: Dict[str, str]) -> list:
-        """Generate Bedrock ActionFormData from Container definition."""
         lines = [
             f"// Container → UI Form: {container_info['class_name']}",
             "const show_container_form = async (player) => {",
@@ -1001,10 +1495,10 @@ class ComponentUIBridge:
             f"    form.title('{container_info['class_name']}');",
             "    ",
         ]
-        
+
         for button in container_info.get('buttons', []):
             lines.append(f"    form.button('{button['label']}');")
-        
+
         lines.extend([
             "    ",
             "    const response = await form.show(player);",
@@ -1012,55 +1506,388 @@ class ComponentUIBridge:
             "    ",
             "    switch (response.selection) {",
         ])
-        
+
         for i, button in enumerate(container_info.get('buttons', [])):
             lines.append(f"        case {i}:")
             lines.append(f"            handle_container_action_{button['id']}(player);")
             lines.append(f"            break;")
-        
+
         lines.extend([
             "    }",
             "};",
             "",
         ])
-        
+
         return lines
 
-# ============================================================================
-# REGISTRY SYSTEM: Dependency & Relationship Tracker
-# ============================================================================
+
+class JavaGUIConverter:
+
+
+    _GUI_BASES = {
+        'Screen', 'AbstractContainerScreen', 'GuiScreen',
+        'AbstractGui', 'ContainerScreen', 'ChestScreen',
+    }
+
+    @staticmethod
+    def is_gui_class(java_code: str) -> bool:
+        return bool(re.search(
+            r'extends\s+(?:' + '|'.join(JavaGUIConverter._GUI_BASES) + r')',
+            java_code
+        ))
+
+    @staticmethod
+    def extract_gui_info(java_code: str) -> Dict:
+        info: Dict = {
+            'class_name': '',
+            'title':      None,
+            'width':      176,
+            'height':     166,
+            'slots':      [],
+            'buttons':    [],
+            'labels':     [],
+            'text_fields':[],
+        }
+
+        cm = re.search(r'class\s+(\w+)\s+extends', java_code)
+        if cm:
+            info['class_name'] = cm.group(1)
+
+
+        for w_pat in [r'imageWidth\s*=\s*(\d+)', r'xSize\s*=\s*(\d+)']:
+            wm = re.search(w_pat, java_code)
+            if wm:
+                info['width'] = int(wm.group(1))
+                break
+        for h_pat in [r'imageHeight\s*=\s*(\d+)', r'ySize\s*=\s*(\d+)']:
+            hm = re.search(h_pat, java_code)
+            if hm:
+                info['height'] = int(hm.group(1))
+                break
+
+
+        tm = re.search(r'super\s*\([^,]*Component\.translatable\s*\("([^"]+)"\)', java_code)
+        if tm:
+            info['title'] = tm.group(1)
+
+
+        for sm in re.finditer(
+            r'addSlot\s*\(\s*new\s+\w*Slot\s*\([^,]+,\s*(\d+),\s*(\d+),\s*(\d+)\)',
+            java_code
+        ):
+            info['slots'].append({
+                'index': int(sm.group(1)),
+                'x':     int(sm.group(2)),
+                'y':     int(sm.group(3)),
+            })
+
+
+        for bm in re.finditer(
+            r'addRenderableWidget\s*\([^;]*Button\s*\.\s*builder\s*\(Component\.translatable\s*\("([^"]+)"\)[^)]*\)'
+            r'|addButton\s*\(\s*new\s+\w*Button\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"([^"]+)"',
+            java_code
+        ):
+            label = bm.group(1) or bm.group(6) or 'Button'
+            x = int(bm.group(2)) if bm.group(2) else 0
+            y = int(bm.group(3)) if bm.group(3) else 0
+            w = int(bm.group(4)) if bm.group(4) else 80
+            h = int(bm.group(5)) if bm.group(5) else 20
+            info['buttons'].append({'label': label, 'x': x, 'y': y, 'w': w, 'h': h})
+
+
+        for tfm in re.finditer(
+            r'new\s+(?:EditBox|TextField)\s*\([^)]*\)',
+            java_code
+        ):
+            info['text_fields'].append({'hint': 'text_input'})
+
+
+        for lm in re.finditer(
+            r'drawString\s*\([^,]*,\s*"([^"]+)"',
+            java_code
+        ):
+            info['labels'].append({'text': lm.group(1)})
+
+        return info
+
+    @staticmethod
+    def generate_variables_grid_json(gui_info: Dict, namespace: str) -> dict:
+        slots = gui_info.get('slots', [])
+        if not slots:
+            return {}
+        grid_items = []
+        for slot in slots:
+            grid_items.append({
+                'type': 'slot',
+                'index': slot['index'],
+                'offset': [slot['x'] - gui_info['width'] // 2,
+                             slot['y'] - gui_info['height'] // 2, 0],
+            })
+        return {
+            'namespace': namespace,
+            f'{gui_info["class_name"]}_grid': {
+                'type':   'grid',
+                'grid_dimensions': {'x': len(slots), 'y': 1},
+                'grid_item_template': f'{namespace}.{gui_info["class_name"]}_slot',
+                'collection_name': f'{namespace}_container',
+                'grid_rescaling_type': 'none',
+                '__items__': grid_items,
+            },
+        }
+
+    @staticmethod
+    def generate_controls_json(gui_info: Dict, namespace: str) -> dict:
+        controls = {}
+        for i, btn in enumerate(gui_info.get('buttons', [])):
+            key = f'{sanitize_identifier(btn["label"])}_button_{i}'
+            controls[key] = {
+                'type':        'button',
+                'text':        btn['label'],
+                'size':        [btn['w'], btn['h']],
+                'offset':      [btn['x'], btn['y']],
+                'button_mappings': [],
+            }
+        for i, lbl in enumerate(gui_info.get('labels', [])):
+            key = f'label_{i}'
+            controls[key] = {
+                'type':    'label',
+                'text':    lbl['text'],
+                'offset':  [0, i * 10],
+                'color':   [0.2, 0.2, 0.2, 1.0],
+            }
+        return {'namespace': namespace, 'controls': controls}
+
+    @staticmethod
+    def generate_modal_form_js(gui_info: Dict, namespace: str) -> list:
+        cls = gui_info['class_name']
+        safe = sanitize_identifier(cls)
+        title = gui_info.get('title') or cls
+        lines = [
+            f'// GUI Form: {cls} → Bedrock ModalFormData',
+            f'import {{ world }} from "@minecraft/server";',
+            f'import {{ ModalFormData, ActionFormData }} from "@minecraft/server-ui";',
+            '',
+            f'export async function show_{safe}_form(player) {{',
+        ]
+        has_text = bool(gui_info.get('text_fields'))
+        has_btns = bool(gui_info.get('buttons'))
+        if has_text:
+            lines.append(f'    const form = new ModalFormData();')
+            lines.append(f'    form.title("{title}");')
+            for i, tf in enumerate(gui_info['text_fields']):
+                lines.append(f'    form.textField("Field {i}", "Enter value");')
+            lines += [
+                f'    const res = await form.show(player);',
+                f'    if (res.canceled) return;',
+                f'    const [{ ", ".join(f"field{i}" for i in range(len(gui_info["text_fields"]))) }] = res.formValues;',
+            ]
+        elif has_btns:
+            lines.append(f'    const form = new ActionFormData();')
+            lines.append(f'    form.title("{title}");')
+            for btn in gui_info['buttons']:
+                lines.append(f'    form.button("{btn["label"]}");')
+            lines += [
+                f'    const res = await form.show(player);',
+                f'    if (res.canceled) return;',
+                f'    switch (res.selection) {{',
+            ]
+            for i, btn in enumerate(gui_info['buttons']):
+                fn = sanitize_identifier(btn['label'])
+                lines += [
+                    f'        case {i}: handle_{safe}_{fn}(player); break;',
+                ]
+            lines.append(f'    }}')
+        else:
+            lines.append(f'    // No interactive components detected — check PORTING_NOTES')
+        lines += [f'}}', '']
+        return lines
+
+    @staticmethod
+    def process(java_code: str, namespace: str, out_rp: str, out_bp_scripts: str) -> None:
+        if not JavaGUIConverter.is_gui_class(java_code):
+            return
+        gui_info = JavaGUIConverter.extract_gui_info(java_code)
+        if not gui_info['class_name']:
+            return
+        safe = sanitize_identifier(gui_info['class_name'])
+
+        grid = JavaGUIConverter.generate_variables_grid_json(gui_info, namespace)
+        if grid:
+            grid_path = os.path.join(out_rp, 'ui', f'{safe}_grid.json')
+            os.makedirs(os.path.dirname(grid_path), exist_ok=True)
+            with open(grid_path, 'w', encoding='utf-8') as fh:
+                json.dump(grid, fh, indent=2)
+
+        ctrl = JavaGUIConverter.generate_controls_json(gui_info, namespace)
+        ctrl_path = os.path.join(out_rp, 'ui', f'{safe}_controls.json')
+        os.makedirs(os.path.dirname(ctrl_path), exist_ok=True)
+        with open(ctrl_path, 'w', encoding='utf-8') as fh:
+            json.dump(ctrl, fh, indent=2)
+
+        js_lines = JavaGUIConverter.generate_modal_form_js(gui_info, namespace)
+        js_path = os.path.join(out_bp_scripts, f'ui_{safe}.js')
+        os.makedirs(os.path.dirname(js_path), exist_ok=True)
+        with open(js_path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(js_lines))
+        print(f'[gui] {gui_info["class_name"]} → {safe}_controls.json + ui_{safe}.js')
+
+
 class DependencyRegistry:
-    """Tracks relationships between scripts, NBT data, and components."""
-    
+
     def __init__(self):
         self.scripts: Dict[str, Dict] = {}
         self.nbt_properties: Dict[str, Set[str]] = {}
         self.dynamic_props: Dict[str, Set[str]] = {}
         self.tick_entities: Set[str] = set()
         self.capabilities: Dict[str, str] = {}
-    
+
     def register_script(self, script_id: str, depends_on: List[str] = None):
-        """Register a script and its dependencies."""
         self.scripts[script_id] = {'depends_on': depends_on or [], 'code': ''}
-    
+
     def register_nbt_property(self, entity_id: str, prop_name: str):
-        """Register an NBT property that needs dynamic property translation."""
         if entity_id not in self.nbt_properties:
             self.nbt_properties[entity_id] = set()
         self.nbt_properties[entity_id].add(prop_name)
-    
+
     def register_dynamic_property(self, entity_id: str, prop_name: str):
-        """Register a dynamic property for save persistence."""
         if entity_id not in self.dynamic_props:
             self.dynamic_props[entity_id] = set()
         self.dynamic_props[entity_id].add(prop_name)
-    
+
     def mark_entity_for_ticking(self, entity_id: str):
-        """Mark entity as requiring per-tick updates."""
         self.tick_entities.add(entity_id)
 
+
+class GlobalCapabilityRegistry:
+
+    @staticmethod
+    def generate_registry_js(namespace: str) -> list:
+        return [
+            'import { world } from "@minecraft/server";',
+            '',
+            '// ── Global Capability Registry ────────────────────────────────────────────',
+            '// Shared by all converted mods in this pack.  Keys are namespaced to avoid',
+            '// collisions when multiple mods are loaded side-by-side.',
+            '',
+            'const _ns = (ns, key) => `${ns}:cap_${key}`;',
+            '',
+            'export const CapRegistry = {',
+            '',
+            '    // ── Energy ──────────────────────────────────────────────────────────',
+            '    energy: {',
+            '        /** Receive energy into entity up to maxCapacity RF/FE.  Returns accepted amount. */',
+            '        receive(entity, ns, amount, maxCapacity = 1_000_000) {',
+            '            const key = _ns(ns, "energy");',
+            '            const cur = entity.getDynamicProperty(key) ?? 0;',
+            '            const accepted = Math.min(amount, maxCapacity - cur);',
+            '            entity.setDynamicProperty(key, cur + accepted);',
+            '            return accepted;',
+            '        },',
+            '        extract(entity, ns, amount) {',
+            '            const key = _ns(ns, "energy");',
+            '            const cur = entity.getDynamicProperty(key) ?? 0;',
+            '            const extracted = Math.min(amount, cur);',
+            '            entity.setDynamicProperty(key, cur - extracted);',
+            '            return extracted;',
+            '        },',
+            '        get(entity, ns) { return entity.getDynamicProperty(_ns(ns,"energy")) ?? 0; },',
+            '        set(entity, ns, v){ entity.setDynamicProperty(_ns(ns,"energy"), v); },',
+            '    },',
+            '',
+            '    // ── Fluid ───────────────────────────────────────────────────────────',
+            '    fluid: {',
+            '        fill(entity, ns, fluidId, amount, capacity = 1000) {',
+            '            const amtKey  = _ns(ns, "fluid_amount");',
+            '            const typeKey = _ns(ns, "fluid_type");',
+            '            const curAmt  = entity.getDynamicProperty(amtKey) ?? 0;',
+            '            const curType = entity.getDynamicProperty(typeKey) ?? fluidId;',
+            '            if (curAmt > 0 && curType !== fluidId) return 0;',
+            '            const filled  = Math.min(amount, capacity - curAmt);',
+            '            entity.setDynamicProperty(amtKey,  curAmt + filled);',
+            '            entity.setDynamicProperty(typeKey, fluidId);',
+            '            return filled;',
+            '        },',
+            '        drain(entity, ns, amount) {',
+            '            const amtKey = _ns(ns, "fluid_amount");',
+            '            const cur    = entity.getDynamicProperty(amtKey) ?? 0;',
+            '            const drained = Math.min(amount, cur);',
+            '            entity.setDynamicProperty(amtKey, cur - drained);',
+            '            return { amount: drained, type: entity.getDynamicProperty(_ns(ns,"fluid_type")) ?? "minecraft:water" };',
+            '        },',
+            '        getAmount(entity, ns){ return entity.getDynamicProperty(_ns(ns,"fluid_amount")) ?? 0; },',
+            '        getType(entity,   ns){ return entity.getDynamicProperty(_ns(ns,"fluid_type"))   ?? "minecraft:water"; },',
+            '    },',
+            '',
+            '    // ── Item slots ──────────────────────────────────────────────────────',
+            '    item: {',
+            '        /** Insert an ItemStack JSON into a named slot. */',
+            '        insert(entity, ns, slotIndex, itemJson) {',
+            '            const key = _ns(ns, `item_slot_${slotIndex}`);',
+            '            if (entity.getDynamicProperty(key)) return false;',
+            '            entity.setDynamicProperty(key, JSON.stringify(itemJson));',
+            '            return true;',
+            '        },',
+            '        extract(entity, ns, slotIndex) {',
+            '            const key  = _ns(ns, `item_slot_${slotIndex}`);',
+            '            const raw  = entity.getDynamicProperty(key);',
+            '            if (!raw) return null;',
+            '            entity.setDynamicProperty(key, undefined);',
+            '            return JSON.parse(raw);',
+            '        },',
+            '        get(entity, ns, slotIndex) {',
+            '            const raw = entity.getDynamicProperty(_ns(ns,`item_slot_${slotIndex}`));',
+            '            return raw ? JSON.parse(raw) : null;',
+            '        },',
+            '    },',
+            '',
+            '    // ── Cross-mod DynamicProperty sharing ──────────────────────────────',
+            '    data: {',
+            '        get(entity, ns, key)      { return entity.getDynamicProperty(_ns(ns, key)); },',
+            '        set(entity, ns, key, val) { entity.setDynamicProperty(_ns(ns, key), val); },',
+            '        has(entity, ns, key)      { return entity.getDynamicProperty(_ns(ns, key)) !== undefined; },',
+            '        del(entity, ns, key)      { entity.setDynamicProperty(_ns(ns, key), undefined); },',
+            '    },',
+            '',
+            '    // ── Registration (call from worldInitialize) ───────────────────────',
+            '    registerProperties(propertyRegistry, ns, energyMax = 1_000_000) {',
+            '        propertyRegistry.defineEntityNumberProperty(_ns(ns,"energy"),       0);',
+            '        propertyRegistry.defineEntityNumberProperty(_ns(ns,"fluid_amount"), 0);',
+            '        propertyRegistry.defineEntityStringProperty(_ns(ns,"fluid_type"),   "minecraft:water");',
+            '    },',
+            '',
+            '};  // end CapRegistry',
+            '',
+            '// Auto-register on world init',
+            f'world.afterEvents.worldInitialize.subscribe((e) => {{',
+            f'    CapRegistry.registerProperties(e.propertyRegistry, "{namespace}");',
+            f'}});',
+            '',
+        ]
+
+    @staticmethod
+    def write(namespace: str, bp_folder: str) -> None:
+        out_path = os.path.join(bp_folder, 'scripts', 'cap_registry.js')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(GlobalCapabilityRegistry.generate_registry_js(namespace)))
+        print(f'[cap_registry] Wrote {out_path}')
+
+    @staticmethod
+    def ensure_import_in_main(bp_folder: str) -> None:
+        main_path = os.path.join(bp_folder, 'scripts', 'main.js')
+        import_line = 'import "./cap_registry.js";\n'
+        if os.path.exists(main_path):
+            with open(main_path, 'r', encoding='utf-8') as fh:
+                content = fh.read()
+            if 'cap_registry' not in content:
+                with open(main_path, 'w', encoding='utf-8') as fh:
+                    fh.write(import_line + content)
+        else:
+            with open(main_path, 'w', encoding='utf-8') as fh:
+                fh.write(import_line)
+
+
 def log_critical_failure(message: str):
-    """Log a critical failure to PORTING_NOTES.txt for unsupported Forge features."""
     porting_notes_path = os.path.join(BP_FOLDER, "PORTING_NOTES.txt")
     with open(porting_notes_path, "a", encoding="utf-8") as f:
         f.write(f"CRITICAL FAILURE: {message}\n")
@@ -1193,14 +2020,14 @@ def sanitize_identifier(name: Optional[str]) -> str:
     if not name:
         return ""
     s = str(name).strip().lower()
-    # replace whitespace with _
+
     s = ''.join('_' if c.isspace() else c for c in s)
-    # replace non alnum . _ with _
+
     s = ''.join(c if c.isalnum() or c in '._' else '_' for c in s)
-    # collapse multiple _
+
     while '__' in s:
         s = s.replace('__', '_')
-    # collapse multiple .
+
     while '..' in s:
         s = s.replace('..', '.')
     s = s.strip('._')
@@ -1208,11 +2035,11 @@ def sanitize_identifier(name: Optional[str]) -> str:
 def sanitize_filename_keep_ext(filename: str) -> str:
     base, ext = os.path.splitext(filename)
     base_s = base.lower()
-    # replace space and - with _
+
     base_s = base_s.replace(' ', '_').replace('-', '_')
-    # replace non alnum . _ with _
+
     base_s = ''.join(c if c.isalnum() or c in '._' else '_' for c in base_s)
-    # collapse multiple _
+
     while '__' in base_s:
         base_s = base_s.replace('__', '_')
     base_s = base_s.strip('._')
@@ -1335,7 +2162,7 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with jar.open(file) as src_file, open(dest, "wb") as out_file:
                         shutil.copyfileobj(src_file, out_file)
-                    # Check for mcmeta
+
                     mcmeta_file = file + '.mcmeta'
                     try:
                         with jar.open(mcmeta_file) as mcmeta_src:
@@ -1344,7 +2171,7 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
                                 anim = mcmeta_data['animation']
                                 frames = anim.get('frames', [])
                                 if isinstance(frames, list) and frames:
-                                    # Handle frame indices or objects
+
                                     if all(isinstance(f, int) for f in frames):
                                         frame_list = frames
                                     else:
@@ -1670,7 +2497,7 @@ def _eval_rot_expr(expr: str) -> Optional[float]:
         return math.degrees(val)
     except (ValueError, TypeError):
         pass
-    # check if it's a valid math expression
+
     allowed_chars = set('0123456789.+-*/() ')
     if not all(c in allowed_chars for c in s):
         return None
@@ -1682,7 +2509,7 @@ def _eval_rot_expr(expr: str) -> Optional[float]:
     return None
 def _extract_method_body(java_code: str, method_names: List[str]) -> Optional[str]:
     if not JAVALANG_AVAILABLE:
-        # fallback to old regex way, but since we removed re, use simple string find
+
         for name in method_names:
             idx = java_code.find(f' {name}(')
             if idx == -1:
@@ -1895,7 +2722,7 @@ def convert_layerdefinition_to_geckolib(
         def _abs_pivot(var: str) -> List[float]:
             if var not in var_to_parent_var:
                 return var_to_bone.get(var, {}).get('pivot', [0.0, 0.0, 0.0])
-            # Iterative traversal to avoid recursion depth limits
+
             path = []
             current = var
             visited = set()
@@ -1905,10 +2732,10 @@ def convert_layerdefinition_to_geckolib(
                 visited.add(current)
                 path.append(current)
                 current = var_to_parent_var[current]
-                if len(path) > 100:  # Safety limit
+                if len(path) > 100:                
                     break
             if current == root_var:
-                # Build absolute pivot by accumulating from root
+
                 abs_pivot = [0.0, 0.0, 0.0]
                 for v in reversed(path):
                     rel = var_to_bone[v]['pivot']
@@ -2333,8 +3160,8 @@ def scan_and_convert_layerdefinition_models(
         'AdvancedEntityModel', 'ExtendedEntityModel', 'CitadelEntityModel',
         'BipedModel', 'QuadrupedModel', 'AgeableModel',
         'GeoModel', 'GeoLayerRenderer',
-        'TileEntitySpecialRenderer', 'BlockEntityRenderer',  # Added for tile entities
-        'Block'  # Added for functional blocks
+        'TileEntitySpecialRenderer', 'BlockEntityRenderer',                           
+        'Block'                               
     ]
     CTOR_SIGNALS = ('setRotationPoint', 'addBox', 'addChild', 'setTextureOffset',
                     'texOffset', 'rotateAngleX', 'rotateAngleY', 'rotateAngleZ',
@@ -2785,7 +3612,7 @@ def build_rp_asset_index():
                     geometry.append((f"geometry.{sanitize_identifier(stem)}", abs_path))
     _RP_ASSET_INDEX["textures"] = textures
     _RP_ASSET_INDEX["geometry"] = geometry
-    # Write flipbook_textures.json
+
     if _RP_ASSET_INDEX["flipbook_textures"]:
         flipbook_path = os.path.join(RP_FOLDER, "textures", "flipbook_textures.json")
         os.makedirs(os.path.dirname(flipbook_path), exist_ok=True)
@@ -4532,11 +5359,11 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
     if not is_likely_entity(java_code, java_path):
         stats["skipped_files"].append(java_path)
         return
-    
-    # Build symbol table for context
+
+
     symbol_table = JavaSymbolTable()
     symbol_table.build_from_code(java_code)
-    
+
     parts = entity_identifier.split(":")
     namespace = sanitize_identifier(parts[0]) if parts else "converted"
     entity_name = sanitize_identifier(parts[1]) if len(parts) > 1 else sanitize_identifier("entity")
@@ -4575,8 +5402,8 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
             "events": {}
         }
     }
-    
-    # Detect capabilities and add dynamic properties
+
+
     dynamic_properties = {}
     if 'IEnergyStorage' in java_code or 'receiveEnergy' in java_code:
         dynamic_properties[f"{namespace}:energy_stored"] = {"type": "int", "default": 0}
@@ -5092,7 +5919,7 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
     extract_and_generate_particles(java_code, clean_identifier, namespace)
     if "TradeWithPlayerGoal" in ai_goals:
         generate_trading_table(clean_identifier, java_code, namespace)
-    # Generate Scripting API JS for complex entity behaviors (tick, hurt, die, interact, etc.)
+
     generate_entity_script(java_code, clean_identifier.split(":")[-1], clean_identifier, namespace)
 def choose_icon_size_for(width: int, height: int) -> int:
     m = min(width, height)
@@ -5720,45 +6547,44 @@ def process_loot_tables_from_jar(jar_path: str, namespace: str):
                 print(f"[loot] Failed to convert {name}: {e}")
     print(f"[loot] Converted {count} loot tables -> {out_base}")
 def generate_entity_script(java_code: str, entity_name: str, entity_id: str, namespace: str):
-    """Generate Scripting API JS for entity behaviors using AST transpilation."""
     symbol_table = JavaSymbolTable()
     symbol_table.build_from_code(java_code)
-    
-    # Extract tick method
+
+
     tick_method = detect_tick_method(java_code)
     if not tick_method:
         return
-    
+
     tick_logic = tick_method[1]
-    
-    # Parse tick logic into statements
+
+
     if not JAVALANG_AVAILABLE:
         return
-    
+
     try:
         tree = javalang.parse.parse(f"class Dummy {{ {tick_logic} }}")
     except:
         return
-    
+
     method_body = None
     for cls in tree.types:
         for method in cls.methods:
             if method.name == 'tick':
                 method_body = method.body
                 break
-    
+
     if not method_body:
         return
-    
+
     js_lines = []
     for stmt in method_body:
         translated = translate_statement(stmt, 'entity', namespace, symbol_table)
         js_lines.extend(translated)
-    
+
     if not js_lines:
         return
-    
-    # Generate JS file
+
+
     script_content = [
         'import { world, system } from "@minecraft/server";',
         '',
@@ -5784,12 +6610,12 @@ def generate_entity_script(java_code: str, entity_name: str, entity_id: str, nam
         '    }',
         '});'
     ])
-    
+
     out_path = os.path.join(BP_FOLDER, "scripts", f"{entity_name}.js")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(script_content))
-    
+
     print(f"[script] Generated entity script: {out_path}")
 def generate_trading_table(entity_id: str, java_code: str, namespace: str):
     safe_name = sanitize_identifier(entity_id.split(":")[-1])
@@ -5935,7 +6761,7 @@ def extract_item_tags_from_jar(jar_path: str, namespace: str):
 def run_class_decompiler(jar_file, output_dir):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     lib_jar = os.path.join(script_dir, "tools", "ClassDecompiler.jar")
-    
+
     if not os.path.exists(lib_jar):
         print(f"Error: ClassDecompiler.jar not found at {lib_jar}")
         return None
@@ -5952,7 +6778,7 @@ def run_class_decompiler(jar_file, output_dir):
             else:
                 print("Vineflower jar not found in ClassDecompiler.jar")
                 return None
-        
+
         subprocess.run(
             ["java", "-jar", os.path.abspath(lib_jar), 
              os.path.abspath(jar_file), os.path.abspath(output_dir)],
@@ -5977,18 +6803,18 @@ def main():
         return
 
     modmorpher_input_folder = f"src_{os.path.splitext(target_jar)[0]}"
-    
+
     extracted_engine = run_class_decompiler(target_jar, modmorpher_input_folder)
-    
+
     if extracted_engine:
         print(f"Decompilation successful. Preparing environment for ModMorpher...")
-        
+
         if os.path.exists(extracted_engine):
             os.remove(extracted_engine)
 
         print("Running modmorpher pipeline...")
         run_pipeline()
-        
+
         print("Pipeline finished.")
     else:
         print("Pipeline aborted due to decompiler errors.")
@@ -6125,7 +6951,7 @@ _BLOCK_EVENT_METHOD_MAP = {
     "onRemove":        ("afterEvents", "playerBreakBlock",        "event.player"),
     "playerDestroy":   ("afterEvents", "playerBreakBlock",        "event.player"),
 }
-# randomTick and tick require special handling (system.runInterval) — kept separate
+
 _BLOCK_TICK_METHODS = ["randomTick", "tick", "animateTick"]
 
 def generate_block_script(java_code: str, safe_name: str, block_id: str, namespace: str) -> bool:
@@ -6135,23 +6961,23 @@ def generate_block_script(java_code: str, safe_name: str, block_id: str, namespa
         if body:
             found_methods.append((method_name, phase, bedrock_event, entity_ref, body))
 
-    # Collect tick/randomTick bodies for system.runInterval treatment
+
     tick_bodies = []
     for method_name in _BLOCK_TICK_METHODS:
         body = _extract_method_body(java_code, method_name)
         if body:
             tick_bodies.append((method_name, body))
 
-    # Detect BlockEntityTicker / getTicker for block entity tick behavior
+
     has_be_ticker = bool(re.search(
         r'getTicker\s*\(|BlockEntityTicker\s*<|createTickerHelper\s*\(',
         java_code
     ))
     if has_be_ticker and not tick_bodies:
-        # Create a placeholder tick body so we emit at least a stub
+
         tick_bodies.append(("blockEntityTick", ""))
 
-    # ContainerMenu / GUI detection → porting note
+
     if re.search(r'AbstractContainerMenu|MenuType|createMenu\s*\(|getMenuType\s*\(', java_code):
         _PORTING_NOTES.append(
             f"[block] {safe_name}: uses a ContainerMenu / custom GUI. "
@@ -6175,7 +7001,7 @@ def generate_block_script(java_code: str, safe_name: str, block_id: str, namespa
     base_imports = ", ".join(imports_parts)
     script_lines = [f'import {{ {base_imports} }} from "@minecraft/server";', '']
 
-    # Event-based methods
+
     for method_name, phase, bedrock_event, entity_ref, body in found_methods:
         translated = _translate_use_body(body, namespace, safe_name)
         script_lines += [
@@ -6187,7 +7013,7 @@ def generate_block_script(java_code: str, safe_name: str, block_id: str, namespa
             f'    if (!actor) return;',
         ] + translated + ['});', '']
 
-    # randomTick / tick / blockEntityTick → system.runInterval
+
     if tick_bodies:
         script_lines += [
             f'// Periodic tick behavior ported from: {", ".join(m for m, _ in tick_bodies)}',
@@ -6211,7 +7037,7 @@ def generate_block_script(java_code: str, safe_name: str, block_id: str, namespa
             '}, 20);',
             '',
         ]
-        # Also emit the modern blockRandomTick subscription as a comment block
+
         script_lines += [
             f'// Modern alternative: use world.afterEvents.blockRandomTick (requires @minecraft/server ≥1.9):',
             f'// world.afterEvents.blockRandomTick.subscribe((event) => {{',
@@ -6342,31 +7168,31 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
         lines.append(f'        const inv = player.getComponent("minecraft:inventory");')
         lines.append(f'        if (inv) {{ const slot = inv.container.getSlot(player.selectedSlotIndex); slot.amount = Math.max(0, slot.amount - 1); }}')
 
-    # Explosion
+
     explode_m = re.search(r'(?:explode|createExplosion)\s*\([^,)]*,\s*([0-9.f]+)', body)
     if explode_m:
         power = float(explode_m.group(1).rstrip('f'))
         lines.append(f'        player.dimension.createExplosion(player.location, {power}, {{ breaksBlocks: true }});')
 
-    # XP / experience
+
     xp_m = re.search(r'(?:addXp|giveExperiencePoints|giveExperience|addExperience)\s*\(\s*([0-9]+)', body)
     if xp_m:
         lines.append(f'        player.addExperience({xp_m.group(1)});')
 
-    # sendMessage / displayClientMessage
+
     msg_m = re.search(r'(?:sendSystemMessage|displayClientMessage|sendMessage)\s*\(\s*(?:Component\.(?:literal|translatable)\s*\(\s*)?["\']([^"\']+)["\']', body)
     if msg_m:
         lines.append(f'        player.sendMessage("{msg_m.group(1)}");')
     elif re.search(r'(?:sendSystemMessage|displayClientMessage|sendMessage)\s*\(', body):
         lines.append(f'        // TODO: player.sendMessage("...");')
 
-    # setBlockAndUpdate / setBlock — change block state in world
+
     setblock_m = re.search(r'(?:setBlockAndUpdate|setBlock)\s*\([^,]+,\s*Blocks\.(\w+)', body)
     if setblock_m:
         bedrock_block = f"minecraft:{setblock_m.group(1).lower()}"
         lines.append(f'        // TODO: block.setPermutation(BlockPermutation.resolve("{bedrock_block}"));')
 
-    # scheduledTick / scheduleTick → system.runTimeout
+
     sched_m = re.search(r'(?:scheduleTick|scheduleBlockTick)\s*\([^,]+,\s*[^,]+,\s*(\d+)', body)
     if sched_m:
         delay = int(sched_m.group(1))
@@ -6374,19 +7200,19 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
         lines.append(f'            // TODO: scheduled tick logic (originally {delay} game ticks)')
         lines.append(f'        }}, {delay});')
 
-    # Particle spawning
+
     particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
     if particle_m:
         java_particle = particle_m.group(1).split(".")[-1].lower()
         bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:enchantment_table_particle")
         lines.append(f'        player.dimension.spawnParticle("{bedrock_particle}", player.location);')
 
-    # setDeltaMovement / velocity impulse
+
     vel_m = re.search(r'setDeltaMovement\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
     if vel_m:
         lines.append(f'        player.applyImpulse({{ x: {vel_m.group(1)}, y: {vel_m.group(2)}, z: {vel_m.group(3)} }});')
 
-    # Dynamic property get/set (SynchedEntityData or NBT)
+
     nbt_set = re.search(r'getPersistentData\(\)\.put(?:Int|Float|Double|Boolean|String)\s*\(\s*["\'](\w+)["\']', body)
     if nbt_set:
         lines.append(f'        // TODO: entity.setDynamicProperty("{namespace}:{nbt_set.group(1)}", value);')
@@ -6394,12 +7220,8 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
     return lines
 
 
-# ---------------------------------------------------------------------------
-# Entity Scripting API generation
-# ---------------------------------------------------------------------------
-
 _ENTITY_SCRIPT_METHODS: Dict[str, Tuple[str, str, str]] = {
-    # method_name: (phase, bedrock_event, entity_ref_in_event)
+
     "hurt":                  ("afterEvents", "entityHurt",               "event.hurtEntity"),
     "die":                   ("afterEvents", "entityDie",                "event.deadEntity"),
     "doHurtTarget":          ("afterEvents", "entityHitEntity",          "event.damagingEntity"),
@@ -6411,17 +7233,16 @@ _ENTITY_SCRIPT_METHODS: Dict[str, Tuple[str, str, str]] = {
     "shoot":                 ("afterEvents", "projectileHitEntity",      "event.projectile"),
     "onProjectileHit":       ("afterEvents", "projectileHitEntity",      "event.projectile"),
 }
-# Methods that need system.runInterval (per-tick behavior)
+
 _ENTITY_TICK_METHODS: List[str] = [
     "tick", "aiStep", "customServerAiStep", "serverAiStep", "baseTick", "rideTick"
 ]
 
 
 def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
-    """Translate a Java entity method body into Bedrock Scripting API JS lines."""
     lines = []
 
-    # Mob effects
+
     for hit in re.findall(
         r'new\s+MobEffectInstance\s*\(\s*MobEffects\.(\w+)\s*,\s*(\d+)\s*(?:,\s*(\d+))?',
         body
@@ -6433,63 +7254,63 @@ def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
             f'{{ amplifier: {int(amp) if amp else 0}, showParticles: true }});'
         )
 
-    # Sound
+
     for hit in re.findall(r'SoundEvents\.(\w+)', body):
         bedrock_sound = _SOUND_NAME_MAP.get(hit, "random.pop")
         lines.append(f'            entity.dimension.playSound("{bedrock_sound}", entity.location);')
 
-    # Healing
+
     heal_m = re.search(r'(?:heal|setHealth)\s*\(\s*([0-9.f]+)', body)
     if heal_m:
         amount = float(heal_m.group(1).rstrip('f'))
         lines.append(f'            const health = entity.getComponent("minecraft:health");')
         lines.append(f'            if (health) health.setCurrentValue(Math.min(health.currentValue + {amount}, health.effectiveMax));')
 
-    # Damage
+
     hurt_m = re.search(r'(?<!player\.)(?:hurt|damage)\s*\(\s*[^,)]+,\s*([0-9.f]+)', body)
     if hurt_m:
         lines.append(f'            entity.applyDamage({float(hurt_m.group(1).rstrip("f"))});')
 
-    # On fire
+
     fire_m = re.search(r'(?:setOnFire|setSecondsOnFire)\s*\(\s*(\d+)', body)
     if fire_m:
         lines.append(f'            entity.setOnFire({int(fire_m.group(1))});')
 
-    # Spawn entity
+
     for hit in re.findall(r'(?:addFreshEntity|summon|spawnEntity)\s*\(\s*new\s+(\w+)\s*\(', body):
         eid = f"{namespace}:{sanitize_identifier(hit)}"
         lines.append(f'            entity.dimension.spawnEntity("{eid}", entity.location);')
 
-    # Explosion
+
     explode_m = re.search(r'(?:explode|createExplosion)\s*\([^,)]*,\s*([0-9.f]+)', body)
     if explode_m:
         power = float(explode_m.group(1).rstrip('f'))
         lines.append(f'            entity.dimension.createExplosion(entity.location, {power}, {{ breaksBlocks: true }});')
 
-    # Particle
+
     particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
     if particle_m:
         java_particle = particle_m.group(1).split(".")[-1].lower()
         bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:enchantment_table_particle")
         lines.append(f'            entity.dimension.spawnParticle("{bedrock_particle}", entity.location);')
 
-    # Teleport / moveTo
+
     tp_m = re.search(r'(?:teleportTo|moveTo)\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
     if tp_m:
         lines.append(f'            entity.teleport({{ x: {tp_m.group(1)}, y: {tp_m.group(2)}, z: {tp_m.group(3)} }});')
     elif re.search(r'teleportTo\s*\(|teleport\s*\(', body):
         lines.append(f'            // TODO: entity.teleport(targetLocation);')
 
-    # Velocity impulse
+
     vel_m = re.search(r'setDeltaMovement\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
     if vel_m:
         lines.append(f'            entity.applyImpulse({{ x: {vel_m.group(1)}, y: {vel_m.group(2)}, z: {vel_m.group(3)} }});')
 
-    # Remove entity
+
     if re.search(r'(?:remove|discard)\s*\(\s*\)', body):
         lines.append(f'            entity.remove();')
 
-    # SynchedEntityData → dynamic properties
+
     for m in re.findall(r'entityData\.set\s*\(\s*(\w+)\s*,\s*(.+?)\s*\)', body):
         field_ref, value_expr = m
         v = value_expr.strip()
@@ -6498,7 +7319,7 @@ def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
         else:
             lines.append(f'            // TODO: entity.setDynamicProperty("{namespace}:{safe_name}_{field_ref.lower()}", value);')
 
-    # NBT persistent data
+
     nbt_m = re.search(r'getPersistentData\(\)\.put(?:Int|Float|Double|Boolean|String)\s*\(\s*["\'](\w+)["\']', body)
     if nbt_m:
         lines.append(f'            // TODO: entity.setDynamicProperty("{namespace}:{nbt_m.group(1)}", value);')
@@ -6510,7 +7331,6 @@ def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
 
 
 def generate_entity_dynamic_properties(java_code: str, safe_name: str, namespace: str) -> list:
-    """Return worldInitialize lines for SynchedEntityData fields → Bedrock dynamic properties."""
     lines = []
     for m in re.finditer(
         r'EntityDataAccessor\s*<\s*(\w+)\s*>\s+(\w+)\s*=\s*SynchedEntityData\.defineId\s*\([^)]*EntityDataSerializers\.(\w+)',
@@ -6531,11 +7351,10 @@ def generate_entity_dynamic_properties(java_code: str, safe_name: str, namespace
 
 
 def generate_entity_script(java_code: str, safe_name: str, entity_id: str, namespace: str) -> bool:
-    """Generate a Bedrock Scripting API .js file for entity Java behavior that JSON cannot express."""
     script_parts: List[List[str]] = []
     needs_system = False
 
-    # --- Per-tick methods → system.runInterval ---
+
     tick_bodies = []
     for method_name in _ENTITY_TICK_METHODS:
         body = _extract_method_body(java_code, method_name)
@@ -6559,7 +7378,7 @@ def generate_entity_script(java_code: str, safe_name: str, entity_id: str, names
         tick_lines += ['        }', '    }', '}, 1);']
         script_parts.append(tick_lines)
 
-    # --- Event-based methods ---
+
     for method_name, (phase, bedrock_event, entity_ref) in _ENTITY_SCRIPT_METHODS.items():
         body = _extract_method_body(java_code, method_name)
         if not body:
@@ -6573,7 +7392,7 @@ def generate_entity_script(java_code: str, safe_name: str, entity_id: str, names
         ] + translated + ['});']
         script_parts.append(ev_lines)
 
-    # --- SynchedEntityData → dynamic property registration ---
+
     dp_lines = generate_entity_dynamic_properties(java_code, safe_name, namespace)
     if dp_lines:
         script_parts.append(
@@ -6583,14 +7402,14 @@ def generate_entity_script(java_code: str, safe_name: str, entity_id: str, names
             + ['});']
         )
 
-    # --- AbstractContainerMenu / GUI → porting note ---
+
     if re.search(r'AbstractContainerMenu|MenuType|createMenu\s*\(|getMenuType\s*\(', java_code):
         _PORTING_NOTES.append(
             f"[entity] {safe_name}: uses AbstractContainerMenu (custom GUI). "
             f"Custom GUIs have no Bedrock equivalent — use block inventory components or a Form UI addon."
         )
 
-    # --- @EventBusSubscriber instance-level events ---
+
     for event_type, (phase, bedrock_event) in _FORGE_EVENT_MAP.items():
         short = event_type.split(".")[-1]
         pat = (
@@ -6639,7 +7458,6 @@ def generate_entity_script(java_code: str, safe_name: str, entity_id: str, names
     print(f"[entity-script] Wrote {out_path}")
     return True
 
-# ---------------------------------------------------------------------------
 
 _INHERITANCE_GRAPH: Dict[str, str] = {}
 _PORTING_NOTES: list = []
@@ -6837,7 +7655,7 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
 
         script_lines = [f'import {{ world }} from "@minecraft/server";', '']
 
-        # Add energy if detected
+
         if is_energy:
             script_lines.append(
                 f'world.afterEvents.worldInitialize.subscribe((e) => {{'
@@ -6848,7 +7666,7 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
             script_lines.append('});')
             script_lines.append('')
 
-        # Add fluid if detected
+
         if is_fluid:
             script_lines.append(
                 f'world.afterEvents.worldInitialize.subscribe((e) => {{'
@@ -6862,7 +7680,7 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
             script_lines.append('});')
             script_lines.append('')
 
-        # Add energy functions if detected
+
         if is_energy:
             script_lines += [
                 f'function receiveEnergy(entity, amount, simulate = false) {{',
@@ -6885,7 +7703,7 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
                 '',
             ]
 
-        # Add fluid functions if detected
+
         if is_fluid:
             script_lines += [
                 f'function fill(entity, fluidStack, simulate = false) {{',
@@ -6963,8 +7781,8 @@ _PACKET_HANDLER_PATTERNS = [
 ]
 
 def scan_networking(java_files: Dict[str, str], namespace: str) -> None:
-    channel_files = {}
-    packet_classes = {}
+    channel_files: dict = {}
+    packet_classes: dict = {}                    
 
     for path, code in java_files.items():
         for pat in _PACKET_HANDLER_PATTERNS:
@@ -6973,68 +7791,129 @@ def scan_networking(java_files: Dict[str, str], namespace: str) -> None:
                 channel_files[path] = (code, m.group(1))
                 break
 
-        if re.search(r'implements\s+(?:[A-Za-z,\s]*\b(?:CustomPacketPayload|FriendlyByteBuf)\b)', code):
+        if re.search(
+            r'implements\s+(?:[A-Za-z,\s]*\b(?:CustomPacketPayload|FriendlyByteBuf)\b)',
+            code
+        ):
             cls_name = extract_class_name(code)
             if cls_name:
                 packet_classes[cls_name] = code
 
-        reg_patterns = re.findall(
-            r'\.registerMessage\s*\([^,]+,\s*(\w+)\.class',
-            code
-        ) + re.findall(
-            r'\.messageBuilder\s*\(\s*(\w+)\.class',
-            code
-        )
-        for pcls in reg_patterns:
+        for pcls in (
+            re.findall(r'\.registerMessage\s*\([^,]+,\s*(\w+)\.class', code) +
+            re.findall(r'\.messageBuilder\s*\(\s*(\w+)\.class', code) +
+            re.findall(r'\.play\.toClient\(\s*(\w+)\.class', code) +
+            re.findall(r'\.play\.toServer\(\s*(\w+)\.class', code)
+        ):
             if pcls not in packet_classes:
                 packet_classes[pcls] = ""
 
     if not channel_files and not packet_classes:
         return
 
-    script_lines = [f'import {{ world, system }} from "@minecraft/server";', '']
+    serverbound_lines: list = [
+        f'import {{ world, system }} from "@minecraft/server";', ''
+    ]
+    clientbound_lines: list = []
+
+    def _classify_direction(pcode: str) -> str:
+        if re.search(r'void\s+handle\s*\([^)]*(?:Level|ServerLevel|Player|ServerPlayer)[^)]*\)', pcode):
+            return 'server'
+        if re.search(r'void\s+handle\s*\([^)]*Minecraft[^)]*\)', pcode):
+            return 'client'
+        if re.search(r'\bServerPayloadHandler\b|\bPlayPayloadHandler\b', pcode):
+            return 'server'
+        if re.search(r'\bClientPayloadHandler\b', pcode):
+            return 'client'
+        return 'unknown'
+
+    def _extract_packet_fields(pcode: str) -> list:
+        fields = re.findall(
+            r'(?:private|public|protected|final)\s+(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*[;=]',
+            pcode
+        )
+
+        skip = {'LOGGER', 'HANDLER', 'TYPE', 'STREAM_CODEC', 'ID', 'serialVersionUID'}
+        return [(ft, fn) for ft, fn in fields if fn not in skip][:12]
 
     for pcls, pcode in packet_classes.items():
         safe = sanitize_identifier(pcls)
-        fields = re.findall(
-            r'(?:private|public|protected|final)\s+(?:final\s+)?(\w+)\s+(\w+)\s*[;=]',
-            pcode
-        ) if pcode else []
+        direction = _classify_direction(pcode) if pcode else 'unknown'
+        fields = _extract_packet_fields(pcode) if pcode else []
 
-        script_lines += [
-            f'world.afterEvents.scriptEventReceive.subscribe((event) => {{',
-            f'    if (event.id !== "{namespace}:{safe}") return;',
-        ]
 
-        if fields:
-            script_lines.append(f'    const data = JSON.parse(event.message);')
-            for ftype, fname in fields[:8]:
-                bedrock_type = _CAP_FIELD_TYPE_MAP.get(ftype, "any")
-                script_lines.append(f'    const {fname} = data.{fname};')
+        field_lines: list = ['    const data = JSON.parse(event.message);']
+        for ftype, fname in fields:
+            btype = _CAP_FIELD_TYPE_MAP.get(ftype, 'any')
+            cast = '' if btype in ('any', 'string') else (
+                'Number(' + f'data.{fname}' + ')'
+                if btype == 'number' else
+                'Boolean(' + f'data.{fname}' + ')'
+                if btype == 'boolean' else
+                f'data.{fname}'
+            )
+            field_lines.append(
+                f'    const {fname} = {cast if cast else f"data.{fname}"};')
+
+
+        handle_body = _extract_method_body(pcode, 'handle') if pcode else ''
+        handle_comment = []
+        if handle_body:
+            for line in handle_body.strip().splitlines()[:8]:
+                handle_comment.append(f'    // java: {line.strip()}')
+
+        if direction in ('server', 'unknown'):
+            event_id = f'{namespace}:{safe}'
+            serverbound_lines += [
+                f'// Packet: {pcls}  [{direction}-bound]',
+                f'world.afterEvents.scriptEventReceive.subscribe((event) => {{',
+                f'    if (event.id !== "{event_id}") return;',
+            ] + field_lines + [
+                f'    const player = [...world.getAllPlayers()].find(p => p.name === data.sender);',
+                f'    if (!player) return;',
+            ] + handle_comment + [
+                f'    // TODO: implement server logic for {pcls}',
+                f'}});',
+                '',
+            ]
         else:
-            script_lines.append(f'    const data = JSON.parse(event.message);')
 
-        script_lines += [
-            f'    const player = [...world.getAllPlayers()].find(p => p.name === data.sender);',
-            f'    if (!player) return;',
-            f'}});',
-            '',
-        ]
+            event_id = f'client:{namespace}:{safe}'
+            clientbound_lines += [
+                f'// Client-bound Packet: {pcls}',
+                f'// Bedrock has no direct client-side scripting API equivalent.',
+                f'// This handler re-emits the data as a "client:" prefixed script event',
+                f'// that the UI layer can subscribe to via world.afterEvents.scriptEventReceive.',
+                f'world.afterEvents.scriptEventReceive.subscribe((event) => {{',
+                f'    if (event.id !== "{event_id}") return;',
+            ] + field_lines + [
+                f'    // Re-broadcast to all players (or filter by data.target)',
+                f'    for (const p of world.getAllPlayers()) {{',
+                f'        p.runCommand(`scriptevent {namespace}:{safe}_ack ${{JSON.stringify(data)}}`);',
+                f'    }}',
+                f'}});',
+                '',
+            ]
 
         _PORTING_NOTES.append(
-            f"[network] Packet {pcls} converted to scriptEventReceive id={namespace}:{safe} — "
-            f"Java-side packet sending must be replaced with '/scriptevent {namespace}:{safe} {{...}}' calls or "
-            f"equivalent Scripting API scriptEventReceive triggers"
+            f"[network] {direction.upper()} packet '{pcls}' → "
+            f"scriptEventReceive id='{event_id}'.  "
+            f"Java sender must call: world.events.server.execute(() -> "
+            f"MinecraftServer#execute('/scriptevent {event_id} {{...}}'))."
         )
 
-    if script_lines[-1] != '':
-        script_lines.append('')
+    all_lines = serverbound_lines
+    if clientbound_lines:
+        all_lines += ['// ── Client-bound packets ──', ''] + clientbound_lines
+
+    if all_lines[-1] != '':
+        all_lines.append('')
 
     out_path = os.path.join(BP_FOLDER, "scripts", "network_packets.js")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(script_lines))
-    print(f"[network] Wrote {out_path}")
+        f.write("\n".join(all_lines))
+    print(f"[network] Wrote {out_path} ({len(packet_classes)} packet class(es))")
 
 _CLIENT_RENDERER_BASES = {
     "EntityRenderer", "MobRenderer", "LivingEntityRenderer",
@@ -7199,17 +8078,17 @@ def _get_player_var(event_type: str, param: str) -> str:
     return f"{param}.player"
 
 def _translate_handler_body(java_body: str, event_type: str, param: str, java_code_full: str, namespace: str, safe_name: str) -> list:
-    # Enhanced translation using AST parsing when available, falling back to regex patterns
-    # This provides more accurate Java-to-JS conversion for event handlers
+
+
     lines = []
     player = _get_player_var(event_type, param)
 
-    # Try AST-based translation first
+
     ast_lines = JavaAST.translate_java_body_to_js(java_body, event_type, param, namespace, safe_name)
     if ast_lines:
         lines.extend(ast_lines)
     else:
-        # Fallback to regex-based translation
+
         needs_inv = bool(re.search(r'\.shrink\s*\(|\.addItem\s*\(|getItemStack\s*\(', java_body))
         needs_block = bool(re.search(r'setBlock\s*\(|getBlockState\s*\(|getBlockPos\s*\(|getHitVec\s*\(', java_body))
 
@@ -7249,7 +8128,7 @@ def _translate_handler_body(java_body: str, event_type: str, param: str, java_co
             r'(?:stack|itemStack|heldStack)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
             java_body
         )
-        
+
         if item_identity_check and not item_is_checks:
             ref = item_identity_check.group(1).split(".")[-1]
             lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(ref)}") return;')
@@ -7309,7 +8188,7 @@ def _translate_handler_body(java_body: str, event_type: str, param: str, java_co
                 item_name = sanitize_identifier(plain)
             lines.append(f'    inv.addItem(new ItemStack("{namespace}:{item_name}"));')
 
-        # Additional patterns for energy and fluid calls
+
         energy_receive = re.search(r'energy\.receiveEnergy\s*\(\s*(\d+)\s*\)', java_body)
         if energy_receive:
             amt = energy_receive.group(1)
@@ -7392,7 +8271,7 @@ def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namesp
             translated = _translate_use_body(hurt_body, namespace, safe_name)
             script_lines += ['    onHitEntity(event) {', '        const player = event.attackingEntity;', '        if (!player) return;'] + translated + ['    }']
         if finish_body:
-            # finishUsingItem fires when the player finishes using (e.g. eating, drinking)
+
             translated = _translate_use_body(finish_body, namespace, safe_name)
             script_lines += ['    onConsume(event) {', '        const player = event.source;', '        if (!player) return;'] + translated + ['    }']
         if crafted_body:
@@ -7401,7 +8280,7 @@ def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namesp
                 '    // See the world.afterEvents.crafted.subscribe block below.',
             ]
         if tick_body:
-            # inventoryTick → system.runInterval scanning inventory, not a component callback
+
             script_lines += [
                 '    // inventoryTick has no direct item-component callback.',
                 '    // Handled by the system.runInterval block below.',
@@ -7415,7 +8294,7 @@ def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namesp
             '',
         ]
 
-    # inventoryTick → system.runInterval scanning all players' inventories
+
     if tick_body:
         translated = _translate_use_body(tick_body, namespace, safe_name)
         script_lines += [
@@ -7434,7 +8313,7 @@ def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namesp
             '',
         ]
 
-    # onCraftedBy → world.afterEvents.crafted
+
     if crafted_body:
         translated = _translate_use_body(crafted_body, namespace, safe_name)
         script_lines += [
@@ -7678,14 +8557,14 @@ JAVA_PARTICLE_MAP = {
 def extract_and_generate_particles(java_code: str, entity_id: str, namespace: str):
     safe_name = sanitize_identifier(entity_id.split(":")[-1])
     found = set()
-    # Find all particle references
-    particle_refs = re.findall(r'\b(\w+)\s*\.\s*spawn\s*\(', java_code)  # Assuming spawn method
+
+    particle_refs = re.findall(r'\b(\w+)\s*\.\s*spawn\s*\(', java_code)                         
     for ref in particle_refs:
         if ref in JAVA_PARTICLE_MAP:
             found.add((ref, JAVA_PARTICLE_MAP[ref]))
         else:
-            # Custom particle, generate basic
-            found.add((ref, "minecraft:enchantment_table_particle"))  # Improved fallback
+
+            found.add((ref, "minecraft:enchantment_table_particle"))                     
     if not found:
         return
     out_dir = os.path.join(RP_FOLDER, "particles")
@@ -9262,6 +10141,22 @@ def run_pipeline():
         scan_networking(java_files, namespace)
     with _logger.phase("Scanning client-only classes", total=0, unit="step", colour="magenta"):
         scan_client_classes(java_files)
+    with _logger.phase("Writing Global Cap Registry", total=0, unit="step", colour="green"):
+        GlobalCapabilityRegistry.write(namespace, BP_FOLDER)
+        GlobalCapabilityRegistry.ensure_import_in_main(BP_FOLDER)
+    with _logger.phase("Scanning GUI / Screen classes", total=0, unit="step", colour="cyan"):
+        for _gui_path, _gui_code in java_files.items():
+            JavaGUIConverter.process(_gui_code, namespace, RP_FOLDER,
+                                     os.path.join(BP_FOLDER, "scripts"))
+    with _logger.phase("Scanning NBT serializers", total=0, unit="step", colour="cyan"):
+        for _nbt_path, _nbt_code in java_files.items():
+            _nbt_cls = extract_class_name(_nbt_code)
+            if _nbt_cls and re.search(
+                r'addAdditionalSaveData|readAdditionalSaveData', _nbt_code
+            ):
+                _nbt_id = f'{namespace}:{sanitize_identifier(_nbt_cls)}'
+                RecursiveNBTSerializer.scan_and_emit_nbt_scripts(
+                    _nbt_code, _nbt_id, namespace, BP_FOLDER)
     if jar_path:
         with _logger.phase("Processing loot / recipes / tags", total=0, unit="step", colour="blue"):
             process_loot_tables_from_jar(jar_path, namespace)
@@ -9305,6 +10200,13 @@ def run_pipeline():
         _orig(f"    Scripts       {script_count:>4}                        ")
     if _PORTING_NOTES:
         _orig(f"    Manual items  {len(_PORTING_NOTES):>4}  (see PORTING_NOTES.txt) ")
+    gui_dir = os.path.join(RP_FOLDER, "ui")
+    gui_count = len([f for f in os.listdir(gui_dir) if f.endswith(".json")]) if os.path.isdir(gui_dir) else 0
+    if gui_count:
+        _orig(f"    GUI screens   {gui_count:>4}  (controls + grid JSON)  ")
+    nbt_scripts = [f for f in (os.listdir(os.path.join(BP_FOLDER,"scripts")) if os.path.isdir(os.path.join(BP_FOLDER,"scripts")) else []) if f.endswith("_nbt.js")]
+    if nbt_scripts:
+        _orig(f"    NBT scripts   {len(nbt_scripts):>4}  (recursive serializers) ")
     _orig("  ")
     if stats["missing_geometry"]:
         _orig(f"\n    {len(stats['missing_geometry'])} entity/entities using placeholder geometry:")

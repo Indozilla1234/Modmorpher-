@@ -1,7 +1,6 @@
-Tool_Version = "1.3.1"
+Tool_Version = "1.4"
 
 import os
-import re
 import json
 import uuid
 import zipfile
@@ -11,7 +10,8 @@ import time
 import sys
 import math
 import subprocess
-from typing import Optional, Tuple, Dict, Set, List
+import re
+from typing import Optional, Tuple, Dict, Set, List, Union
 try:
     from tqdm import tqdm as _tqdm
     TQDM_AVAILABLE = True
@@ -113,7 +113,7 @@ class _ProgressLogger:
         return f"    {text}"
 _logger = _ProgressLogger()
 _ALL_JAVA_FILES: Dict[str, str] = {}
-_RP_ASSET_INDEX: Dict[str, list] = {"textures": [], "geometry": []}
+_RP_ASSET_INDEX: Dict[str, Union[list, dict]] = {"textures": [], "geometry": [], "flipbook_textures": {}}
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -322,6 +322,749 @@ class JavaAST:
             if isinstance(arg, javalang.tree.Literal) and arg.value and arg.value.startswith('"'):
                 return arg.value.strip('"')
         return None
+    @staticmethod
+    def translate_java_body_to_js(java_body: str, event_type: str, param: str, namespace: str, safe_name: str) -> list:
+        if not JAVALANG_AVAILABLE:
+            return []
+        # Wrap the body in a dummy class and method for parsing
+        dummy_code = f"""
+public class Dummy {{
+    public void dummy() {{
+        {java_body}
+    }}
+}}
+"""
+        try:
+            tree = javalang.parse.parse(dummy_code)
+            lines = []
+            player = _get_player_var(event_type, param)
+            # Find the method body
+            for path, node in tree:
+                if isinstance(node, javalang.tree.MethodDeclaration) and node.name == 'dummy':
+                    for stmt in node.body:
+                        js_stmts = translate_statement(stmt, player, namespace)
+                        lines.extend(js_stmts)
+            return lines
+        except Exception:
+            return []
+
+def translate_method_invocation(invocation: object, player: str, namespace: str, symbol_table: JavaSymbolTable) -> Optional[str]:
+    # Enhanced translation with NBT support and capability detection
+    member = getattr(invocation, 'member', '')
+    qualifier = getattr(invocation, 'qualifier', None)
+    if qualifier and isinstance(qualifier, str):
+        pass  # It's already a string
+    elif qualifier and isinstance(qualifier, list) and len(qualifier) == 1:
+        qualifier = qualifier[0]
+    else:
+        qualifier = None
+    args = getattr(invocation, 'arguments', [])
+    
+    if member == 'receiveEnergy':
+        if args and isinstance(args[0], javalang.tree.Literal):
+            amt = args[0].value
+            return f'    receiveEnergy({player}, {amt});'
+    elif member == 'extractEnergy':
+        if args and isinstance(args[0], javalang.tree.Literal):
+            amt = args[0].value
+            return f'    extractEnergy({player}, {amt});'
+    
+    # NBT Translation: Try to map to Bedrock dynamic properties
+    nbt_result = NBTTranslator.translate_nbt_call(member, args, namespace, player)
+    if nbt_result:
+        return nbt_result
+    
+    # Capability detection
+    cap_type = symbol_table.method_belongs_to_capability(member)
+    if cap_type:
+        if cap_type == 'energy' and member not in ('receiveEnergy', 'extractEnergy'):
+            # Handle other energy methods like getEnergyStored
+            if member == 'getEnergyStored':
+                return f'getEnergyStored({player})'
+        elif cap_type == 'fluid':
+            if member == 'fill' and len(args) >= 2:
+                fluid_stack = translate_expression(args[0])
+                return f'    fill({player}, {fluid_stack});'
+            elif member == 'drain' and len(args) >= 1:
+                amount = translate_expression(args[0])
+                return f'    drain({player}, {amount});'
+    
+    # Use the method map for standard translations
+    bedrock_call = JavaToBedrockMethodMap.translate_method_call(member, args, qualifier)
+    if bedrock_call:
+        return bedrock_call
+    
+    # Add more translations
+    return None
+
+def translate_statement(stmt: object, player: str, namespace: str, symbol_table: JavaSymbolTable) -> list:
+    if isinstance(stmt, javalang.tree.StatementExpression):
+        expr = stmt.expression
+        if isinstance(expr, javalang.tree.MethodInvocation):
+            js_line = translate_method_invocation(expr, player, namespace, symbol_table)
+            return [js_line] if js_line else []
+        elif isinstance(expr, javalang.tree.Assignment):
+            # Handle assignments like x = y
+            left = translate_expression(expr.expressionl)
+            right = translate_expression(expr.value)
+            if left and right:
+                return [f'    {left} = {right};']
+    elif isinstance(stmt, javalang.tree.LocalVariableDeclaration):
+        # Handle variable declarations
+        type_name = stmt.type.name if hasattr(stmt.type, 'name') else str(stmt.type)
+        js_type = 'let'  # Default to let
+        for decl in stmt.declarators:
+            var_name = decl.name
+            init = ''
+            if decl.initializer:
+                init_val = translate_expression(decl.initializer)
+                if init_val:
+                    init = f' = {init_val}'
+            return [f'    {js_type} {var_name}{init};']
+    elif isinstance(stmt, javalang.tree.IfStatement):
+        # Handle if statements
+        condition = translate_expression(stmt.condition)
+        if condition:
+            lines = [f'    if ({condition}) {{']
+            # Handle then_statement
+            then_stmts = stmt.then_statement
+            if isinstance(then_stmts, javalang.tree.BlockStatement):
+                for s in then_stmts.statements:
+                    lines.extend(translate_statement(s, player, namespace))
+            elif isinstance(then_stmts, list):
+                for s in then_stmts:
+                    lines.extend(translate_statement(s, player, namespace))
+            else:
+                lines.extend(translate_statement(then_stmts, player, namespace))
+            lines.append('    }')
+            if stmt.else_statement:
+                lines.append('    else {')
+                else_stmts = stmt.else_statement
+                if isinstance(else_stmts, javalang.tree.BlockStatement):
+                    for s in else_stmts.statements:
+                        lines.extend(translate_statement(s, player, namespace))
+                elif isinstance(else_stmts, list):
+                    for s in else_stmts:
+                        lines.extend(translate_statement(s, player, namespace))
+                else:
+                    lines.extend(translate_statement(else_stmts, player, namespace))
+                lines.append('    }')
+            return lines
+    elif isinstance(stmt, javalang.tree.ReturnStatement):
+        # Handle return
+        if stmt.expression:
+            expr = translate_expression(stmt.expression)
+            return [f'    return {expr};'] if expr else ['    return;']
+        else:
+            return ['    return;']
+    elif isinstance(stmt, javalang.tree.ForStatement):
+        # Handle for loops
+        init = stmt.initialization
+        condition = translate_expression(stmt.condition) if stmt.condition else None
+        update = stmt.update
+        lines = []
+        if condition:
+            lines.append(f'    for (let i = 0; {condition}; i++) {{')
+            # Translate loop body
+            if stmt.body:
+                body_list = stmt.body if isinstance(stmt.body, list) else [stmt.body]
+                for s in body_list:
+                    lines.extend(translate_statement(s, player, namespace))
+            lines.append('    }')
+        return lines
+    # Add more statement types
+    return []
+
+def translate_expression(expr: object) -> Optional[str]:
+    if isinstance(expr, javalang.tree.Literal):
+        return str(expr.value)
+    elif isinstance(expr, javalang.tree.MemberReference):
+        return expr.member
+    elif isinstance(expr, javalang.tree.MethodInvocation):
+        # For now, simple translation
+        member = getattr(expr, 'member', '')
+        args = getattr(expr, 'arguments', [])
+        arg_strs = []
+        for arg in args:
+            arg_trans = translate_expression(arg)
+            if arg_trans:
+                arg_strs.append(arg_trans)
+        return f'{member}({", ".join(arg_strs)})'
+    elif isinstance(expr, javalang.tree.BinaryOperation):
+        left = translate_expression(expr.operandl)
+        right = translate_expression(expr.operandr)
+        op = expr.operator
+        if left and right:
+            return f'{left} {op} {right}'
+    # Add more expression types
+    return None
+
+def detect_tick_method(java_code: str) -> Optional[Tuple[str, str]]:
+    """Detect and extract tick/server tick logic from Java code."""
+    if not JAVALANG_AVAILABLE:
+        return None
+    try:
+        tree = javalang.parse.parse(java_code)
+        for _, node in tree:
+            if isinstance(node, javalang.tree.MethodDeclaration):
+                if node.name in ('onTick', 'tick', 'serverTick', 'update', 'doUpdate'):
+                    # Extract method body
+                    method_body = []
+                    for stmt in node.body:
+                        method_body.extend(translate_statement(stmt, 'this', 'namespace'))
+                    return (node.name, '\n'.join(method_body))
+    except Exception:
+        pass
+    return None
+
+def generate_tick_handler_js(namespace: str, entity_id: str, tick_logic: str) -> list:
+    """Generate Bedrock tick handler from Java tick logic."""
+    lines = [
+        f"world.afterEvents.entitySpawn.subscribe((e) => {{",
+        f"    if (!e.entity.typeId.includes('{namespace}:{entity_id}')) return;",
+        f"    const tick_id = setInterval(() => {{",
+        f"        {tick_logic}",
+        f"    }}, 50); // Bedrock tick = ~50ms in scripting API",
+        f"    e.entity.onTickEventCalls = (e.entity.onTickEventCalls || 0) + 1;",
+        f"}});",
+    ]
+    return lines
+class JavaSymbolTable:
+    """Maintains type information for Java classes and variables during translation."""
+    def __init__(self):
+        self.classes: Dict[str, Dict] = {}  # class name -> {methods, fields, superclass, interfaces}
+        self.variables: Dict[str, str] = {}  # var name -> type name
+        self.method_return_types: Dict[str, str] = {}  # method name -> return type
+    
+    def register_class(self, class_name: str, superclass: Optional[str] = None, interfaces: List[str] = None):
+        """Register a class with its hierarchy."""
+        self.classes[class_name] = {
+            'superclass': superclass,
+            'interfaces': interfaces or [],
+            'methods': {},
+            'fields': {}
+        }
+    
+    def register_method(self, class_name: str, method_name: str, return_type: str, params: Dict[str, str]):
+        """Register a method with its signature."""
+        if class_name in self.classes:
+            self.classes[class_name]['methods'][method_name] = {
+                'return': return_type,
+                'params': params
+            }
+    
+    def register_field(self, class_name: str, field_name: str, field_type: str):
+        """Register a field with its type."""
+        if class_name in self.classes:
+            self.classes[class_name]['fields'][field_name] = field_type
+    
+    def set_variable_type(self, var_name: str, var_type: str):
+        """Set the type of a variable in current scope."""
+        self.variables[var_name] = var_type
+    
+    def get_variable_type(self, var_name: str) -> Optional[str]:
+        """Get the type of a variable."""
+        return self.variables.get(var_name)
+    
+    def method_belongs_to_capability(self, method_name: str) -> Optional[str]:
+        """Determine if a method belongs to a Forge Capability (Energy, Fluid, etc)."""
+        energy_methods = {'receiveEnergy', 'extractEnergy', 'getEnergyStored', 'getMaxEnergyStored'}
+        fluid_methods = {'fill', 'drain', 'getFluidAmount', 'getTankCapacity'}
+        item_methods = {'getCount', 'setCount', 'grow', 'shrink', 'isEmpty'}
+        
+        if method_name in energy_methods:
+            return 'energy'
+        elif method_name in fluid_methods:
+            return 'fluid'
+        elif method_name in item_methods:
+            return 'itemstack'
+        return None
+    
+    def scan_java_file(self, java_code: str):
+        """Pre-scan a Java file to build symbol table."""
+        if not JAVALANG_AVAILABLE:
+            return
+        try:
+            tree = javalang.parse.parse(java_code)
+            for _, node in tree:
+                if isinstance(node, javalang.tree.ClassDeclaration):
+                    superclass = node.extends.name if node.extends else None
+                    interfaces = [i.name for i in (node.implements or [])]
+                    self.register_class(node.name, superclass, interfaces)
+                    
+                    # Register methods
+                    for method in node.methods:
+                        ret_type = method.return_type.name if method.return_type else 'void'
+                        params = {p.name: p.type.name for p in (method.parameters or [])}
+                        self.register_method(node.name, method.name, ret_type, params)
+                    
+                    # Register fields
+                    for field in node.fields:
+                        field_type = field.type.name if hasattr(field.type, 'name') else str(field.type)
+                        for decl in field.declarators:
+                            self.register_field(node.name, decl.name, field_type)
+        except Exception:
+            pass
+
+class MoLangBridge:
+    """Convert Java mathematical expressions into MoLang for Bedrock animations."""
+    
+    @staticmethod
+    def java_to_molang(java_expr: str) -> str:
+        """Translate Java expressions to MoLang."""
+        # Replace common Java patterns
+        molang = java_expr.replace('Math.sin', 'math.sin')
+        molang = molang.replace('Math.cos', 'math.cos')
+        molang = molang.replace('Math.sqrt', 'math.sqrt')
+        molang = molang.replace('Math.abs', 'math.abs')
+        molang = molang.replace('Math.floor', 'math.floor')
+        molang = molang.replace('Math.ceil', 'math.ceil')
+        # Replace variable references with query calls
+        molang = re.sub(r'\bthis\.(\w+)\b', r'variable.\1', molang)
+        molang = re.sub(r'\breturn\s+', '', molang)
+        return molang
+
+# ============================================================================
+# ANIMATION CONTROLLER GENERATOR
+# ============================================================================
+class AnimationControllerGenerator:
+    """Generate Bedrock animation_controllers.json from Java state machine logic."""
+    
+    @staticmethod
+    def generate_default_controller(entity_name: str, animations: Dict[str, str]) -> dict:
+        """Generate a basic animation controller with state transitions."""
+        controller_name = f"controller.animation.{entity_name}.default"
+        states = {
+            "default": {
+                "animations": list(animations.keys())[:1],  # Play first animation
+            }
+        }
+        # Add simple state transitions based on common conditions
+        for anim_name in list(animations.keys())[1:]:
+            states[anim_name] = {
+                "animations": [anim_name],
+                "transitions": [{"default": "!variable.playing_" + anim_name}]
+            }
+        
+        return {
+            "format_version": "1.10.0",
+            "animation_controllers": {
+                controller_name: {
+                    "states": states
+                }
+            }
+        }
+
+# ============================================================================
+# NBT TRANSLATOR: Map Java NBT operations to Bedrock dynamic properties
+# ============================================================================
+class NBTTranslator:
+    """Translate Java NBT read/write to Bedrock getDynamicProperty/setDynamicProperty."""
+    
+    NBT_TO_BEDROCK_MAP = {
+        'readAdditionalSaveData': 'getDynamicProperty',
+        'addAdditionalSaveData': 'setDynamicProperty',
+        'getInt': 'getDynamicProperty',
+        'putInt': 'setDynamicProperty',
+        'getString': 'getDynamicProperty',
+        'putString': 'setDynamicProperty',
+        'getFloat': 'getDynamicProperty',
+        'putFloat': 'setDynamicProperty',
+        'getBoolean': 'getDynamicProperty',
+        'putBoolean': 'setDynamicProperty',
+    }
+    
+class CapabilityRegistry:
+    """Maps Forge Capabilities to Bedrock Dynamic Properties and JS Managers."""
+    
+    CAPABILITY_TYPES = {
+        'IEnergyStorage': {
+            'properties': ['energy_stored', 'max_energy'],
+            'methods': ['receiveEnergy', 'extractEnergy', 'getEnergyStored', 'getMaxEnergyStored'],
+            'bedrock_type': 'number',
+        },
+        'IFluidHandler': {
+            'properties': ['fluid_amount', 'fluid_type', 'fluid_capacity'],
+            'methods': ['fill', 'drain', 'getFluidAmount', 'getTankCapacity'],
+            'bedrock_type': 'compound',
+        },
+        'IItemHandler': {
+            'properties': ['slot_contents', 'slot_count'],
+            'methods': ['insertItem', 'extractItem', 'getStackInSlot', 'getSlots'],
+            'bedrock_type': 'itemstack',
+        },
+    }
+    
+    @staticmethod
+    def generate_capability_manager(capability_type: str, namespace: str, entity_id: str) -> list:
+        """Generate JS manager functions for a Forge capability."""
+        lines = [
+            'import { ItemStack } from "@minecraft/server";',
+            "",
+        ]
+        
+        if capability_type not in CapabilityRegistry.CAPABILITY_TYPES:
+            return lines
+        
+        cap = CapabilityRegistry.CAPABILITY_TYPES[capability_type]
+        
+        lines.append(f"// {capability_type} Manager for {entity_id}")
+        lines.append(f"const {entity_id}_capabilities = {{")
+        
+        for prop in cap['properties']:
+            lines.append(f"    {prop}: 0,")
+        
+        lines.append(f"}};")
+        lines.append("")
+        
+        # Generate accessor methods
+        for method in cap['methods']:
+            if method.startswith('get'):
+                prop_name = method[3:].lower()
+                lines.append(f"function {entity_id}_{method}(entity) {{")
+                lines.append(f'    return entity.getDynamicProperty("{namespace}:{entity_id}_{prop_name}") || 0;')
+                lines.append(f"}}")
+            elif method in ['receiveEnergy', 'fill']:
+                lines.append(f"function {entity_id}_{method}(entity, amount) {{")
+                lines.append(f'    const current = entity.getDynamicProperty("{namespace}:{entity_id}_stored") || 0;')
+                lines.append(f'    const max = entity.getDynamicProperty("{namespace}:{entity_id}_max") || 1000;')
+                lines.append(f"    const accepted = Math.min(amount, max - current);")
+                lines.append(f'    entity.setDynamicProperty("{namespace}:{entity_id}_stored", current + accepted);')
+                lines.append(f"    return accepted;")
+                lines.append(f"}}")
+            elif method in ['extractEnergy', 'drain']:
+                lines.append(f"function {entity_id}_{method}(entity, amount) {{")
+                lines.append(f'    const current = entity.getDynamicProperty("{namespace}:{entity_id}_stored") || 0;')
+                lines.append(f"    const extracted = Math.min(amount, current);")
+                lines.append(f'    entity.setDynamicProperty("{namespace}:{entity_id}_stored", current - extracted);')
+                lines.append(f"    return extracted;")
+                lines.append(f"}}")
+        
+        lines.append("")
+        return lines
+
+class EventRouter:
+    """Maps Forge @SubscribeEvent handlers to Bedrock world.afterEvents."""
+    
+    FORGE_TO_BEDROCK = {
+        'LivingHurtEvent': ('entityHurt', 'entity'),
+        'LivingDeathEvent': ('entityDie', 'entity'),
+        'PlayerInteractEvent.RightClickEntity': ('playerInteractWithEntity', 'player'),
+        'PlayerInteractEvent.RightClickBlock': ('playerPlaceBlock', 'player'),
+        'BlockEvent.BreakEvent': ('playerBreakBlock', 'player'),
+        'BlockEvent.PlaceEvent': ('playerPlaceBlock', 'player'),
+        'TickEvent.ServerTickEvent': ('worldInitialize', None),  # Special: runs custom tick loop
+        'TickEvent.ClientTickEvent': ('tick', None),  # Per-entity tick
+        'ItemPickupEvent': ('entityPickUpItem', 'entity'),
+        'EntityJoinWorldEvent': ('entitySpawn', 'entity'),
+        'EntityLeaveWorldEvent': ('entityRemove', 'entity'),
+        'PlayerLoggedInEvent': ('playerJoin', 'player'),
+        'PlayerLoggedOutEvent': ('playerLeave', 'player'),
+    }
+    
+    @staticmethod
+    def generate_event_wrapper(forge_event: str, java_logic: str, namespace: str) -> list:
+        """Generate Bedrock event subscription boilerplate."""
+        lines = []
+        
+        if forge_event not in EventRouter.FORGE_TO_BEDROCK:
+            return lines
+        
+        bedrock_event, entity_param = EventRouter.FORGE_TO_BEDROCK[forge_event]
+        
+        if bedrock_event == 'worldInitialize':
+            lines.append(f"world.afterEvents.worldInitialize.subscribe((e) => {{")
+        else:
+            lines.append(f"world.afterEvents.{bedrock_event}.subscribe((e) => {{")
+            if entity_param:
+                lines.append(f"    const {entity_param} = e.{entity_param};")
+        
+        lines.append(java_logic)
+        lines.append("}});")
+        lines.append("")
+        
+        return lines
+
+class MathTranspiler:
+    """Convert Java Vector3d and AxisAlignedBB to Bedrock Vector3 and BlockVolume."""
+    
+    @staticmethod
+    def transpile_vector_op(java_expr: str) -> str:
+        """Convert Java vector operations to Bedrock."""
+        # new Vector3d(x, y, z) → new Vector3(x, y, z)
+        bedrock = re.sub(r'new Vector3d\(([^,]+),\s*([^,]+),\s*([^)]+)\)', r'new Vector3(\1, \2, \3)', java_expr)
+        # vec.add(other) → { x: vec.x + other.x, y: vec.y + other.y, z: vec.z + other.z }
+        bedrock = re.sub(r'(\w+)\.add\((\w+)\)', r'{ x: \1.x + \2.x, y: \1.y + \2.y, z: \1.z + \2.z }', bedrock)
+        # vec.subtract(other) → { x: vec.x - other.x, y: vec.y - other.y, z: vec.z - other.z }
+        bedrock = re.sub(r'(\w+)\.subtract\((\w+)\)', r'{ x: \1.x - \2.x, y: \1.y - \2.y, z: \1.z - \2.z }', bedrock)
+        # vec.scale(factor) → { x: vec.x * factor, y: vec.y * factor, z: vec.z * factor }
+        bedrock = re.sub(r'(\w+)\.scale\(([^)]+)\)', r'{ x: \1.x * \2, y: \1.y * \2, z: \1.z * \2 }', bedrock)
+        # vec.getX() → vec.x
+        bedrock = re.sub(r'\.getX\(\)', '.x', bedrock)
+        bedrock = re.sub(r'\.getY\(\)', '.y', bedrock)
+        bedrock = re.sub(r'\.getZ\(\)', '.z', bedrock)
+        # new AxisAlignedBB(minX, minY, minZ, maxX, maxY, maxZ) → new BlockVolume({ min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } })
+        bedrock = re.sub(r'new AxisAlignedBB\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', 
+                         r'new BlockVolume({ min: { x: \1, y: \2, z: \3 }, max: { x: \4, y: \5, z: \6 } })', bedrock)
+        return bedrock
+    
+    @staticmethod
+    def transpile_math_expr(java_expr: str) -> str:
+        """Convert Java Math expressions to Bedrock-compatible JS."""
+        bedrock = java_expr.replace('Math.PI', 'Math.PI')
+        bedrock = bedrock.replace('Math.sqrt', 'Math.sqrt')
+        bedrock = bedrock.replace('Math.pow', 'Math.pow')
+        bedrock = bedrock.replace('Math.random', 'Math.random')
+        bedrock = re.sub(r'Math\.toRadians\(([^)]+)\)', r'(\1) * Math.PI / 180', bedrock)
+        bedrock = re.sub(r'Math\.toDegrees\(([^)]+)\)', r'(\1) * 180 / Math.PI', bedrock)
+        return bedrock
+
+# ============================================================================
+# PHASE 2: LOGIC TRANSPILER - Comprehensive Forge → Bedrock Method Mapping
+# ============================================================================
+class JavaToBedrockMethodMap:
+    """Canonical method mapping table: Java → Bedrock equivalents."""
+    
+    STRICT_MAPPING = {
+        # World/Block operations
+        'world.setBlockState': 'dimension.getBlock({0}).setPermutation({1})',
+        'world.getBlockState': 'dimension.getBlock({0}).permutation',
+        'world.getBlockEntity': 'dimension.getBlock({0})',
+        'level.setBlockState': 'dimension.getBlock({0}).setPermutation({1})',
+        
+        # Entity operations
+        'entity.getHealth': 'entity.getComponent("health").currentValue',
+        'entity.setHealth': 'entity.getComponent("health").setCurrentValue({0})',
+        'entity.getMaxHealth': 'entity.getComponent("health").maxValue',
+        'entity.getPosition': 'entity.location',
+        'entity.setPosition': 'entity.teleport({0})',
+        'entity.getVelocity': 'entity.velocity',
+        'entity.setVelocity': 'entity.applyImpulse({0})',
+        'entity.kill': 'entity.kill()',
+        
+        # Player operations
+        'player.sendMessage': 'player.sendMessage({0})',
+        'player.getInventory': 'player.getComponent("minecraft:inventory")',
+        'player.addItem': 'player.getComponent("minecraft:inventory").container.addItem({0})',
+        'player.removeItem': 'player.getComponent("minecraft:inventory").container.removeItem({0})',
+        
+        # NBT/Data
+        'itemStack.getTag': 'itemStack.getComponent("minecraft:enchantable")',
+        'compoundTag.getInt': 'entity.getDynamicProperty({0}) || 0',
+        'compoundTag.putInt': 'entity.setDynamicProperty({0}, {1})',
+        
+        # Item operations
+        'new ItemStack': 'new ItemStack({0})',
+        'itemStack.getCount': 'itemStack.amount',
+        'itemStack.setCount': 'itemStack.amount = {0}',
+        
+        # Particle/Sound
+        'world.addParticle': 'dimension.spawnParticle({0}, {1})',
+        'world.playSound': 'dimension.playSound({0}, {1})',
+    }
+    
+    @staticmethod
+    def lookup_method(java_method: str) -> Optional[str]:
+        """Look up Bedrock equivalent for Java method."""
+        bedrock = JavaToBedrockMethodMap.STRICT_MAPPING.get(java_method)
+        if bedrock is None:
+            log_critical_failure(f"No Bedrock equivalent for Java method: {java_method}")
+        return bedrock
+    
+    @staticmethod
+    def translate_method_call(java_method: str, args: list, qualifier: Optional[str] = None) -> Optional[str]:
+        """Translate a Java method call to Bedrock JS, handling arguments."""
+        template = JavaToBedrockMethodMap.lookup_method(java_method)
+        if not template:
+            return None
+        
+        # Translate args
+        translated_args = [translate_expression(arg) for arg in args]
+        
+        # Replace placeholders like {0}, {1}, etc.
+        for i, arg in enumerate(translated_args):
+            template = template.replace(f'{{{i}}}', arg)
+        
+        # Handle specific named placeholders if any
+        # For example, if {pos} and args[0] is pos
+        # But for now, assume positional
+        
+        return template
+
+# ============================================================================
+# PHASE 3: TICK REGISTRY - Central Heartbeat to Prevent Script Watchdog
+# ============================================================================
+class TickRegistry:
+    """Central tick manager for all mod entities. Prevents Bedrock script watchdog."""
+    
+    def __init__(self):
+        self.tick_handlers: Dict[str, list] = {}
+        self.tick_priority: Dict[str, int] = {}
+    
+    def register_tick_handler(self, entity_id: str, logic: str, priority: int = 100):
+        """Register an entity's tick logic."""
+        if entity_id not in self.tick_handlers:
+            self.tick_handlers[entity_id] = []
+        self.tick_handlers[entity_id].append(logic)
+        self.tick_priority[entity_id] = priority
+    
+    def generate_central_tick_loop(self, namespace: str) -> list:
+        """Generate the central tick loop that prevents watchdog timeouts."""
+        lines = [
+            'import { world, system } from "@minecraft/server";',
+            "",
+            "// Central Tick Registry - Prevents Script Watchdog Timeout",
+            "const tick_registry = {",
+            "    handlers: {},",
+            "    max_ms_per_tick: 10, // 10ms max per tick",
+            "};",
+            "",
+            "system.runInterval(() => {",
+            "    const start_time = Date.now();",
+            "    const active_entities = world.getDimension('minecraft:overworld').getEntities({",
+            "        tags: ['mod:needs_tick']",
+            "    });",
+            "",
+            "    for (const entity of active_entities) {",
+            "        if (Date.now() - start_time > tick_registry.max_ms_per_tick) break;",
+            "        const handler_id = entity.typeId;",
+            "        if (tick_registry.handlers[handler_id]) {",
+            "            try {",
+            "                tick_registry.handlers[handler_id](entity);",
+            "            } catch (e) {",
+            "                console.error(`Tick error for ${handler_id}: ${e.message}`);",
+            "            }",
+            "        }",
+            "    }",
+            "}, 1); // Run every game tick",
+            "",
+        ]
+        
+        # Register all handlers
+        for entity_id, handlers in self.tick_handlers.items():
+            lines.append(f"tick_registry.handlers['{namespace}:{entity_id}'] = (entity) => {{")
+            for handler in handlers:
+                lines.extend(handler.split('\n'))
+            lines.append("};")
+            lines.append("")
+        
+        return lines
+
+# ============================================================================
+# PHASE 4: COMPONENT UI BRIDGE - Container → ActionFormData
+# ============================================================================
+class ComponentUIBridge:
+    """Convert Forge Container/Screen classes to Bedrock Server UI forms."""
+    
+    @staticmethod
+    def detect_container_class(java_code: str) -> Optional[Dict[str, str]]:
+        """Detect Container class definition in Java."""
+        if 'class ' not in java_code or 'Container' not in java_code:
+            return None
+        
+        container_info = {
+            'class_name': '',
+            'slots': [],
+            'buttons': [],
+            'fields': []
+        }
+        
+        # Extract class name
+        match = re.search(r'class\s+(\w+)\s+extends\s+Container', java_code)
+        if match:
+            container_info['class_name'] = match.group(1)
+        
+        # Extract slot definitions
+        slot_pattern = r'this\.addSlotToContainer\s*\(\s*new\s+Slot\s*\(([^)]+)\)'
+        for match in re.finditer(slot_pattern, java_code):
+            container_info['slots'].append(match.group(1))
+        
+        # Extract button definitions
+        button_pattern = r'new\s+GuiButton\s*\(\s*(\d+),\s*([^,]+),\s*([^,]+),\s*"([^"]+)"'
+        for match in re.finditer(button_pattern, java_code):
+            container_info['buttons'].append({
+                'id': match.group(1),
+                'x': match.group(2),
+                'y': match.group(3),
+                'label': match.group(4)
+            })
+        
+        return container_info if container_info['class_name'] else None
+    
+    @staticmethod
+    def generate_action_form(container_info: Dict[str, str]) -> list:
+        """Generate Bedrock ActionFormData from Container definition."""
+        lines = [
+            f"// Container → UI Form: {container_info['class_name']}",
+            "const show_container_form = async (player) => {",
+            "    const form = new ActionFormData();",
+            f"    form.title('{container_info['class_name']}');",
+            "    ",
+        ]
+        
+        for button in container_info.get('buttons', []):
+            lines.append(f"    form.button('{button['label']}');")
+        
+        lines.extend([
+            "    ",
+            "    const response = await form.show(player);",
+            "    if (response.canceled) return;",
+            "    ",
+            "    switch (response.selection) {",
+        ])
+        
+        for i, button in enumerate(container_info.get('buttons', [])):
+            lines.append(f"        case {i}:")
+            lines.append(f"            handle_container_action_{button['id']}(player);")
+            lines.append(f"            break;")
+        
+        lines.extend([
+            "    }",
+            "};",
+            "",
+        ])
+        
+        return lines
+
+# ============================================================================
+# REGISTRY SYSTEM: Dependency & Relationship Tracker
+# ============================================================================
+class DependencyRegistry:
+    """Tracks relationships between scripts, NBT data, and components."""
+    
+    def __init__(self):
+        self.scripts: Dict[str, Dict] = {}
+        self.nbt_properties: Dict[str, Set[str]] = {}
+        self.dynamic_props: Dict[str, Set[str]] = {}
+        self.tick_entities: Set[str] = set()
+        self.capabilities: Dict[str, str] = {}
+    
+    def register_script(self, script_id: str, depends_on: List[str] = None):
+        """Register a script and its dependencies."""
+        self.scripts[script_id] = {'depends_on': depends_on or [], 'code': ''}
+    
+    def register_nbt_property(self, entity_id: str, prop_name: str):
+        """Register an NBT property that needs dynamic property translation."""
+        if entity_id not in self.nbt_properties:
+            self.nbt_properties[entity_id] = set()
+        self.nbt_properties[entity_id].add(prop_name)
+    
+    def register_dynamic_property(self, entity_id: str, prop_name: str):
+        """Register a dynamic property for save persistence."""
+        if entity_id not in self.dynamic_props:
+            self.dynamic_props[entity_id] = set()
+        self.dynamic_props[entity_id].add(prop_name)
+    
+    def mark_entity_for_ticking(self, entity_id: str):
+        """Mark entity as requiring per-tick updates."""
+        self.tick_entities.add(entity_id)
+
+def log_critical_failure(message: str):
+    """Log a critical failure to PORTING_NOTES.txt for unsupported Forge features."""
+    porting_notes_path = os.path.join(BP_FOLDER, "PORTING_NOTES.txt")
+    with open(porting_notes_path, "a", encoding="utf-8") as f:
+        f.write(f"CRITICAL FAILURE: {message}\n")
+
 OUTPUT_DIR = "Bedrock_Pack"
 BP_FOLDER = os.path.join(OUTPUT_DIR, "bp")
 RP_FOLDER = os.path.join(OUTPUT_DIR, "rp")
@@ -394,8 +1137,8 @@ def ensure_dirs():
         os.makedirs(folder, exist_ok=True)
         for s in subs:
             os.makedirs(os.path.join(folder, s), exist_ok=True)
-def create_manifest(pack_name: str, pack_type: str):
-    return {
+def create_manifest(pack_name: str, pack_type: str, has_scripting: bool = False):
+    manifest = {
         "format_version": 2,
         "header": {
             "name": pack_name,
@@ -412,37 +1155,33 @@ def create_manifest(pack_name: str, pack_type: str):
             }
         ]
     }
+    if has_scripting and pack_type == "BP":
+        manifest["modules"].append({
+            "type": "script",
+            "language": "javascript",
+            "uuid": str(uuid.uuid4()),
+            "version": [1, 0, 0],
+            "entry": "scripts/main.js"
+        })
+        manifest["capabilities"] = ["scripting"]
+    return manifest
 def write_manifest_for(folder: str, pack_name: str, pack_type: str):
     path = os.path.join(folder, "manifest.json")
     os.makedirs(folder, exist_ok=True)
-    manifest = create_manifest(pack_name, pack_type)
-    if pack_type == "BP":
-        scripts_dir = os.path.join(folder, "scripts")
-        if os.path.isdir(scripts_dir) and any(f.endswith(".js") for f in os.listdir(scripts_dir)):
-            manifest["modules"] = [
-                {
-                    "type": "data",
-                    "uuid": str(uuid.uuid4()),
-                    "version": [1, 0, 0]
-                },
-                {
-                    "type": "script",
-                    "uuid": str(uuid.uuid4()),
-                    "version": [1, 0, 0],
-                    "language": "javascript",
-                    "entry": "scripts/main.js"
-                }
-            ]
-            entry_scripts = [
-                f for f in os.listdir(scripts_dir)
-                if f.endswith(".js") and f != "main.js"
-            ]
-            main_js = os.path.join(scripts_dir, "main.js")
-            if entry_scripts and not os.path.exists(main_js):
-                imports = "\n".join(f'import "./{f}";' for f in sorted(entry_scripts))
-                with open(main_js, "w", encoding="utf-8") as mf:
-                    mf.write(imports + "\n")
-            manifest["dependencies"] = [
+    scripts_dir = os.path.join(folder, "scripts")
+    has_scripting = pack_type == "BP" and os.path.isdir(scripts_dir) and any(f.endswith(".js") for f in os.listdir(scripts_dir))
+    manifest = create_manifest(pack_name, pack_type, has_scripting)
+    if has_scripting:
+        entry_scripts = [
+            f for f in os.listdir(scripts_dir)
+            if f.endswith(".js") and f != "main.js"
+        ]
+        main_js = os.path.join(scripts_dir, "main.js")
+        if entry_scripts and not os.path.exists(main_js):
+            imports = "\n".join(f'import "./{f}";' for f in sorted(entry_scripts))
+            with open(main_js, "w", encoding="utf-8") as mf:
+                mf.write(imports + "\n")
+        manifest["dependencies"] = [
                 {
                     "module_name": "@minecraft/server",
                     "version": "1.13.0"
@@ -454,20 +1193,31 @@ def sanitize_identifier(name: Optional[str]) -> str:
     if not name:
         return ""
     s = str(name).strip().lower()
-    s = re.sub(r'\s+', '_', s)
-    s = re.sub(r'[^a-z0-9_\.]', '_', s)
-    s = re.sub(r'_+', '_', s)
-    s = re.sub(r'\.+', '.', s)
+    # replace whitespace with _
+    s = ''.join('_' if c.isspace() else c for c in s)
+    # replace non alnum . _ with _
+    s = ''.join(c if c.isalnum() or c in '._' else '_' for c in s)
+    # collapse multiple _
+    while '__' in s:
+        s = s.replace('__', '_')
+    # collapse multiple .
+    while '..' in s:
+        s = s.replace('..', '.')
     s = s.strip('._')
     return s
 def sanitize_filename_keep_ext(filename: str) -> str:
     base, ext = os.path.splitext(filename)
     base_s = base.lower()
-    base_s = re.sub(r'[\s\-]+', '_', base_s)
-    base_s = re.sub(r'[^a-z0-9_\.]', '_', base_s)
-    base_s = re.sub(r'_+', '_', base_s)
+    # replace space and - with _
+    base_s = base_s.replace(' ', '_').replace('-', '_')
+    # replace non alnum . _ with _
+    base_s = ''.join(c if c.isalnum() or c in '._' else '_' for c in base_s)
+    # collapse multiple _
+    while '__' in base_s:
+        base_s = base_s.replace('__', '_')
     base_s = base_s.strip('._')
     ext_s = ext.lower()
+    return base_s + ext_s
     return base_s + ext_s
 def build_geometry_id(namespace: Optional[str], name: str) -> str:
     n = sanitize_identifier(name)
@@ -585,6 +1335,29 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with jar.open(file) as src_file, open(dest, "wb") as out_file:
                         shutil.copyfileobj(src_file, out_file)
+                    # Check for mcmeta
+                    mcmeta_file = file + '.mcmeta'
+                    try:
+                        with jar.open(mcmeta_file) as mcmeta_src:
+                            mcmeta_data = json.load(mcmeta_src)
+                            if 'animation' in mcmeta_data:
+                                anim = mcmeta_data['animation']
+                                frames = anim.get('frames', [])
+                                if isinstance(frames, list) and frames:
+                                    # Handle frame indices or objects
+                                    if all(isinstance(f, int) for f in frames):
+                                        frame_list = frames
+                                    else:
+                                        frame_list = [f['index'] if isinstance(f, dict) and 'index' in f else i for i, f in enumerate(frames)]
+                                    flipbook_entry = {
+                                        "flipbook_texture": dest.replace(resource_pack + '/', '').replace('\\', '/'),
+                                        "atlas_tile": dest.replace(resource_pack + '/', '').replace('\\', '/').replace('.png', ''),
+                                        "ticks_per_frame": anim.get('frametime', 1),
+                                        "frames": frame_list if len(frame_list) > 1 and frame_list != list(range(len(frame_list))) else len(frame_list)
+                                    }
+                                    _RP_ASSET_INDEX["flipbook_textures"][flipbook_entry["atlas_tile"]] = flipbook_entry
+                    except:
+                        pass
                     continue
                 if lower_file.endswith(".ogg"):
                     dest = os.path.join(resource_pack, "sound", sanitize_filename_keep_ext(os.path.basename(file)))
@@ -682,7 +1455,7 @@ def copy_assets_from_jar(jar_path: str, resource_pack: str):
                             continue
                         if "/recipes/" in lower_after or fname_base.endswith("_recipe.json") or fname_base.endswith("_recipes.json"):
                             continue
-                        if re.match(r"[a-z]{2}_[a-z]{2}\.json$", fname_base):
+                        if fname_base.endswith('.json') and len(fname_base) == 7 and fname_base[2] == '_' and fname_base[:2].islower() and fname_base[3:5].islower():
                             dest = os.path.join(resource_pack, "lang", sanitize_filename_keep_ext(fname_base))
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
                             with jar.open(file) as src_file, open(dest, "wb") as out_file:
@@ -890,39 +1663,48 @@ def _extract_call_args(text: str, call_start: int, n_args: int) -> Optional[List
     return args if len(args) >= n_args else None
 def _eval_rot_expr(expr: str) -> Optional[float]:
     s = expr.strip().rstrip('Ff ')
-    s = re.sub(r'\(float\)\s*', '', s)
+    s = s.replace('(float)', '').strip()
     s = s.replace('Math.PI', str(math.pi))
     try:
-        return math.degrees(float(s))
+        val = float(s)
+        return math.degrees(val)
     except (ValueError, TypeError):
         pass
+    # check if it's a valid math expression
+    allowed_chars = set('0123456789.+-*/() ')
+    if not all(c in allowed_chars for c in s):
+        return None
     try:
-        if re.fullmatch(r'[-+*/().\d\s]+', s):
-            return math.degrees(eval(s))
+        val = eval(s)
+        return math.degrees(val)
     except Exception:
         pass
     return None
 def _extract_method_body(java_code: str, method_names: List[str]) -> Optional[str]:
+    if not JAVALANG_AVAILABLE:
+        # fallback to old regex way, but since we removed re, use simple string find
+        for name in method_names:
+            idx = java_code.find(f' {name}(')
+            if idx == -1:
+                continue
+            start = java_code.find('{', idx)
+            if start == -1:
+                continue
+            depth, i = 0, start
+            while i < len(java_code):
+                if java_code[i] == '{':
+                    depth += 1
+                elif java_code[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return java_code[start:i + 1]
+                i += 1
+        return None
+    ast = JavaAST(java_code)
     for name in method_names:
-        pat = re.compile(
-            rf'(?:public\s+|private\s+|protected\s+|static\s+)*'
-            rf'(?:\w+(?:<[^>]*>)?)\s+{re.escape(name)}\s*\([^)]*\)\s*\{{',
-            re.DOTALL
-        )
-        m = pat.search(java_code)
-        if not m:
-            continue
-        start = m.end() - 1
-        depth, i = 0, start
-        while i < len(java_code):
-            c = java_code[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    return java_code[start:i + 1]
-            i += 1
+        body = ast.method_body_source(name)
+        if body:
+            return body
     return None
 def convert_layerdefinition_to_geckolib(
     java_code: str,
@@ -945,23 +1727,75 @@ def convert_layerdefinition_to_geckolib(
                 return None
             body = java_code
         tex_w, tex_h = 64, 32
-        tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', body)
-        if not tex_m:
-            tex_m = re.search(r'LayerDefinition\.create\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)', java_code)
-        if tex_m:
-            try:
-                tex_w = int(tex_m.group(1))
-                tex_h = int(tex_m.group(2))
-            except (ValueError, IndexError):
-                pass
-        root_var_m = re.search(r'(\w+)\s*=\s*\w+\.getRoot\s*\(\)', body)
-        root_var = root_var_m.group(1) if root_var_m else 'partdefinition'
+        idx = body.find('LayerDefinition.create(')
+        if idx == -1:
+            idx = java_code.find('LayerDefinition.create(')
+        if idx != -1:
+            start = idx + len('LayerDefinition.create(')
+            comma1 = java_code.find(',', start)
+            if comma1 != -1:
+                comma2 = java_code.find(',', comma1 + 1)
+                if comma2 != -1:
+                    try:
+                        tex_w = int(java_code[comma1 + 1:comma2].strip())
+                        comma3 = java_code.find(',', comma2 + 1)
+                        if comma3 != -1:
+                            tex_h = int(java_code[comma2 + 1:comma3].strip())
+                    except (ValueError, IndexError):
+                        pass
+        root_var = 'partdefinition'
+        idx = body.find(' = ')
+        if idx != -1:
+            end = body.find('.getRoot()', idx)
+            if end != -1:
+                var_part = body[max(0, idx-20):idx].strip()
+                eq_idx = var_part.rfind(' ')
+                if eq_idx != -1:
+                    root_var = var_part[eq_idx+1:].strip()
         var_to_bone: Dict[str, dict] = {
             root_var: {'name': '__root__', 'pivot': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0], 'cubes': []}
         }
         var_to_parent_var: Dict[str, str] = {}
-        CALL_START = re.compile(r'(\w+)\s*=\s*(\w+)\.addOrReplaceChild\s*\(')
-        for cs in CALL_START.finditer(body):
+        start_pos = 0
+        while True:
+            idx = body.find(' = ', start_pos)
+            if idx == -1:
+                break
+            idx2 = body.find('.addOrReplaceChild(', idx)
+            if idx2 == -1:
+                start_pos = idx + 1
+                continue
+            var_part = body[max(0, idx-20):idx].strip()
+            eq_idx = var_part.rfind(' ')
+            if eq_idx == -1:
+                start_pos = idx + 1
+                continue
+            var_name = var_part[eq_idx+1:].strip()
+            parent_part = body[idx:idx2].strip()
+            eq_idx2 = parent_part.find(' = ')
+            if eq_idx2 == -1:
+                start_pos = idx + 1
+                continue
+            parent_var_part = parent_part[max(0, eq_idx2-20):eq_idx2].strip()
+            sp_idx = parent_var_part.rfind(' ')
+            if sp_idx == -1:
+                parent_var = parent_var_part
+            else:
+                parent_var = parent_var_part[sp_idx+1:].strip()
+            paren_start = idx2 + len('.addOrReplaceChild(')
+            depth, i = 0, paren_start
+            while i < len(body):
+                if body[i] == '(':
+                    depth += 1
+                elif body[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        args_content = body[paren_start:i]
+                        break
+                i += 1
+            else:
+                start_pos = idx + 1
+                continue
             var_name = cs.group(1)
             parent_var = cs.group(2)
             try:
@@ -978,20 +1812,23 @@ def convert_layerdefinition_to_geckolib(
                         break
                 i += 1
             args_content = body[paren_start + 1:i]
-            name_m = re.search(r'["\']([^"\']+)["\']', args_content)
-            bone_name = name_m.group(1) if name_m else var_name
+            bone_name = var_name
+            quote1 = args_content.find('"')
+            if quote1 != -1:
+                quote2 = args_content.find('"', quote1 + 1)
+                if quote2 != -1:
+                    bone_name = args_content[quote1+1:quote2]
             pivot = [0.0, 0.0, 0.0]
             rotation = [0.0, 0.0, 0.0]
-            pose_m = re.search(
-                r'PartPose\.offset\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)',
-                args_content
-            )
-            if pose_m:
-                for idx, grp in enumerate(pose_m.groups()):
-                    v = _parse_java_float(grp.strip())
-                    if v is not None:
-                        pivot[idx] = v
-            rot_idx = args_content.find('PartPose.offsetAndRotation')
+            offset_idx = args_content.find('PartPose.offset(')
+            if offset_idx != -1:
+                offset_args = _extract_call_args(args_content, offset_idx, 3)
+                if offset_args:
+                    for idx, arg in enumerate(offset_args):
+                        v = _parse_java_float(arg.strip())
+                        if v is not None:
+                            pivot[idx] = v
+            rot_idx = args_content.find('PartPose.offsetAndRotation(')
             if rot_idx != -1:
                 rot_args = _extract_call_args(args_content, rot_idx, 6)
                 if rot_args and len(rot_args) >= 6:
@@ -1005,64 +1842,80 @@ def convert_layerdefinition_to_geckolib(
                             rotation[idx - 3] = round(deg, 4)
             cubes: list = []
             cur_u, cur_v = 0, 0
-            for tex_m2 in re.finditer(r'\.texOffs\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', args_content):
-                try:
-                    cur_u = int(tex_m2.group(1))
-                    cur_v = int(tex_m2.group(2))
-                except (ValueError, IndexError):
-                    continue
-                after = args_content[tex_m2.end():]
-                ab = re.match(
-                    r'\s*\.addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
-                    r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
-                    after
-                )
-                if ab:
+            tex_start = 0
+            while True:
+                tex_idx = args_content.find('.texOffs(', tex_start)
+                if tex_idx == -1:
+                    break
+                tex_args = _extract_call_args(args_content, tex_idx, 2)
+                if tex_args and len(tex_args) >= 2:
                     try:
-                        vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
-                        cubes.append({
+                        cur_u = int(tex_args[0].strip())
+                        cur_v = int(tex_args[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+                add_idx = args_content.find('.addBox(', tex_idx)
+                if add_idx != -1:
+                    add_args = _extract_call_args(args_content, add_idx, 6)
+                    if add_args and len(add_args) >= 6:
+                        try:
+                            vals = [float(add_args[k].strip().rstrip('Ff')) for k in range(6)]
+                            cubes.append({
+                                "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
+                                "size":   vals[3:6],
+                                "uv":     [cur_u, cur_v],
+                            })
+                        except (ValueError, TypeError, IndexError):
+                            pass
+                tex_start = tex_idx + 1
+            add_start = 0
+            while True:
+                add_idx = args_content.find('.addBox(', add_start)
+                if add_idx == -1:
+                    break
+                add_args = _extract_call_args(args_content, add_idx, 6)
+                if add_args and len(add_args) >= 6:
+                    try:
+                        vals = [float(add_args[k].strip().rstrip('Ff')) for k in range(6)]
+                        candidate = {
                             "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
                             "size":   vals[3:6],
                             "uv":     [cur_u, cur_v],
-                        })
+                        }
+                        if candidate not in cubes:
+                            cubes.append(candidate)
                     except (ValueError, TypeError, IndexError):
                         pass
-            for ab in re.finditer(
-                r'(?<!\w)addBox\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)'
-                r'\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)',
-                args_content
-            ):
-                try:
-                    vals = [float(ab.group(k).strip().rstrip('Ff')) for k in range(1, 7)]
-                    candidate = {
-                        "origin": [pivot[0]+vals[0], pivot[1]+vals[1], pivot[2]+vals[2]],
-                        "size":   vals[3:6],
-                        "uv":     [cur_u, cur_v],
-                    }
-                    if candidate not in cubes:
-                        cubes.append(candidate)
-                except (ValueError, TypeError, IndexError):
-                    pass
+                add_start = add_idx + 1
             var_to_bone[var_name] = {
                 'name': bone_name, 'pivot': pivot, 'rotation': rotation, 'cubes': cubes,
             }
             var_to_parent_var[var_name] = parent_var
-        def _abs_pivot(var: str, depth: int = 0, visited: set = None) -> List[float]:
-            if visited is None:
-                visited = set()
-            if var in visited:
-                return [0.0, 0.0, 0.0]
-            if depth > 8 or var not in var_to_parent_var:
+            start_pos = idx + 1
+        def _abs_pivot(var: str) -> List[float]:
+            if var not in var_to_parent_var:
                 return var_to_bone.get(var, {}).get('pivot', [0.0, 0.0, 0.0])
-            visited.add(var)
-            p = var_to_parent_var[var]
-            if p == root_var:
-                visited.remove(var)
-                return var_to_bone[var]['pivot']
-            parent_abs = _abs_pivot(p, depth + 1, visited)
-            child_rel = var_to_bone[var]['pivot']
-            visited.remove(var)
-            return [parent_abs[k] + child_rel[k] for k in range(3)]
+            # Iterative traversal to avoid recursion depth limits
+            path = []
+            current = var
+            visited = set()
+            while current in var_to_parent_var and current not in visited:
+                if current == root_var:
+                    break
+                visited.add(current)
+                path.append(current)
+                current = var_to_parent_var[current]
+                if len(path) > 100:  # Safety limit
+                    break
+            if current == root_var:
+                # Build absolute pivot by accumulating from root
+                abs_pivot = [0.0, 0.0, 0.0]
+                for v in reversed(path):
+                    rel = var_to_bone[v]['pivot']
+                    abs_pivot = [abs_pivot[i] + rel[i] for i in range(3)]
+                return abs_pivot
+            else:
+                return var_to_bone.get(var, {}).get('pivot', [0.0, 0.0, 0.0])
         gecko_bones = []
         for var, bone in var_to_bone.items():
             if bone['name'] == '__root__':
@@ -1474,16 +2327,15 @@ def scan_and_convert_layerdefinition_models(
     java_files: Dict[str, str],
     namespace: str,
 ) -> Dict[str, str]:
-    MODEL_SUPER_PAT = re.compile(
-        r'extends\s+(?:'
-        r'EntityModel|HierarchicalModel|AgeableMobModel'
-        r'|LayerDefinition|BookOpenModel|ArmedModel|HeadedModel|SkullModelBase'
-        r'|AdvancedEntityModel|ExtendedEntityModel|CitadelEntityModel'
-        r'|BipedModel|QuadrupedModel|AgeableModel'
-        r'|GeoModel|GeoLayerRenderer'
-        r')[^{;]*',
-        re.DOTALL
-    )
+    model_names = [
+        'EntityModel', 'HierarchicalModel', 'AgeableMobModel',
+        'LayerDefinition', 'BookOpenModel', 'ArmedModel', 'HeadedModel', 'SkullModelBase',
+        'AdvancedEntityModel', 'ExtendedEntityModel', 'CitadelEntityModel',
+        'BipedModel', 'QuadrupedModel', 'AgeableModel',
+        'GeoModel', 'GeoLayerRenderer',
+        'TileEntitySpecialRenderer', 'BlockEntityRenderer',  # Added for tile entities
+        'Block'  # Added for functional blocks
+    ]
     CTOR_SIGNALS = ('setRotationPoint', 'addBox', 'addChild', 'setTextureOffset',
                     'texOffset', 'rotateAngleX', 'rotateAngleY', 'rotateAngleZ',
                     'setRotationAngle', 'AdvancedModelBox', 'ModelRenderer')
@@ -1501,7 +2353,15 @@ def scan_and_convert_layerdefinition_models(
         is_ctor_model = any(sig in code for sig in CTOR_SIGNALS)
         if not is_layerdef and not is_ctor_model:
             continue
-        extends_model = bool(MODEL_SUPER_PAT.search(code))
+        extends_model = False
+        idx = code.find('extends ')
+        if idx != -1:
+            end = code.find('{', idx)
+            if end == -1:
+                end = code.find(';', idx)
+            if end != -1:
+                extends_part = code[idx:end]
+                extends_model = any(name in extends_part for name in model_names)
         if not extends_model:
             sig_count = sum(1 for s in CTOR_SIGNALS if s in code)
             if sig_count < 3:
@@ -1925,6 +2785,13 @@ def build_rp_asset_index():
                     geometry.append((f"geometry.{sanitize_identifier(stem)}", abs_path))
     _RP_ASSET_INDEX["textures"] = textures
     _RP_ASSET_INDEX["geometry"] = geometry
+    # Write flipbook_textures.json
+    if _RP_ASSET_INDEX["flipbook_textures"]:
+        flipbook_path = os.path.join(RP_FOLDER, "textures", "flipbook_textures.json")
+        os.makedirs(os.path.dirname(flipbook_path), exist_ok=True)
+        with open(flipbook_path, "w", encoding="utf-8") as f:
+            json.dump(_RP_ASSET_INDEX["flipbook_textures"], f, indent=2)
+        print(f"[flipbook] Wrote flipbook_textures.json with {len(_RP_ASSET_INDEX['flipbook_textures'])} animated texture(s)")
     print(f"[index] Indexed {len(textures)} texture(s) and {len(geometry)} geometry model(s)")
 def _camel_tokens(s: str) -> set:
     s = re.sub(r'([A-Z])', r'_\1', s).lower().strip("_")
@@ -3665,6 +4532,11 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
     if not is_likely_entity(java_code, java_path):
         stats["skipped_files"].append(java_path)
         return
+    
+    # Build symbol table for context
+    symbol_table = JavaSymbolTable()
+    symbol_table.build_from_code(java_code)
+    
     parts = entity_identifier.split(":")
     namespace = sanitize_identifier(parts[0]) if parts else "converted"
     entity_name = sanitize_identifier(parts[1]) if len(parts) > 1 else sanitize_identifier("entity")
@@ -3703,6 +4575,19 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
             "events": {}
         }
     }
+    
+    # Detect capabilities and add dynamic properties
+    dynamic_properties = {}
+    if 'IEnergyStorage' in java_code or 'receiveEnergy' in java_code:
+        dynamic_properties[f"{namespace}:energy_stored"] = {"type": "int", "default": 0}
+        dynamic_properties[f"{namespace}:max_energy"] = {"type": "int", "default": 1000}
+    if 'IFluidHandler' in java_code or 'fill' in java_code:
+        dynamic_properties[f"{namespace}:fluid_amount"] = {"type": "int", "default": 0}
+        dynamic_properties[f"{namespace}:fluid_type"] = {"type": "string", "default": ""}
+    if 'IItemHandler' in java_code or 'insertItem' in java_code:
+        dynamic_properties[f"{namespace}:slot_contents"] = {"type": "string", "default": "[]"}
+    if dynamic_properties:
+        bedrock_entity["minecraft:entity"]["description"]["properties"] = dynamic_properties
     if attributes.get("attack_damage", 0) > 0:
         bedrock_entity["minecraft:entity"]["components"]["minecraft:attack"] = {"damage": int(attributes["attack_damage"])}
     armor_value = float(attributes.get("armor", 0.0))
@@ -4834,6 +5719,78 @@ def process_loot_tables_from_jar(jar_path: str, namespace: str):
             except Exception as e:
                 print(f"[loot] Failed to convert {name}: {e}")
     print(f"[loot] Converted {count} loot tables -> {out_base}")
+def generate_entity_script(java_code: str, entity_name: str, entity_id: str, namespace: str):
+    """Generate Scripting API JS for entity behaviors using AST transpilation."""
+    symbol_table = JavaSymbolTable()
+    symbol_table.build_from_code(java_code)
+    
+    # Extract tick method
+    tick_method = detect_tick_method(java_code)
+    if not tick_method:
+        return
+    
+    tick_logic = tick_method[1]
+    
+    # Parse tick logic into statements
+    if not JAVALANG_AVAILABLE:
+        return
+    
+    try:
+        tree = javalang.parse.parse(f"class Dummy {{ {tick_logic} }}")
+    except:
+        return
+    
+    method_body = None
+    for cls in tree.types:
+        for method in cls.methods:
+            if method.name == 'tick':
+                method_body = method.body
+                break
+    
+    if not method_body:
+        return
+    
+    js_lines = []
+    for stmt in method_body:
+        translated = translate_statement(stmt, 'entity', namespace, symbol_table)
+        js_lines.extend(translated)
+    
+    if not js_lines:
+        return
+    
+    # Generate JS file
+    script_content = [
+        'import { world, system } from "@minecraft/server";',
+        '',
+        f'// Entity script for {entity_id}',
+        f'world.afterEvents.entitySpawn.subscribe((event) => {{',
+        f'    if (event.entity.typeId === "{entity_id}") {{',
+        f'        event.entity.addTag("mod:needs_tick");',
+        f'    }}',
+        f'}});',
+        '',
+        '// Tick logic',
+        'const tick_handlers = {};',
+        f'tick_handlers["{entity_id}"] = (entity) => {{',
+    ]
+    script_content.extend(js_lines)
+    script_content.extend([
+        '};',
+        '',
+        '// Register with central tick registry',
+        'import("./main.js").then(() => {',
+        '    if (typeof tick_registry !== "undefined") {',
+        f'        tick_registry.handlers["{entity_id}"] = tick_handlers["{entity_id}"];',
+        '    }',
+        '});'
+    ])
+    
+    out_path = os.path.join(BP_FOLDER, "scripts", f"{entity_name}.js")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(script_content))
+    
+    print(f"[script] Generated entity script: {out_path}")
 def generate_trading_table(entity_id: str, java_code: str, namespace: str):
     safe_name = sanitize_identifier(entity_id.split(":")[-1])
     out_path = os.path.join(BP_FOLDER, "trading", f"{safe_name}.json")
@@ -5421,7 +6378,7 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
     particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
     if particle_m:
         java_particle = particle_m.group(1).split(".")[-1].lower()
-        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:basic_smoke_particle")
+        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:enchantment_table_particle")
         lines.append(f'        player.dimension.spawnParticle("{bedrock_particle}", player.location);')
 
     # setDeltaMovement / velocity impulse
@@ -5513,7 +6470,7 @@ def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
     particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
     if particle_m:
         java_particle = particle_m.group(1).split(".")[-1].lower()
-        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:basic_smoke_particle")
+        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:enchantment_table_particle")
         lines.append(f'            entity.dimension.spawnParticle("{bedrock_particle}", entity.location);')
 
     # Teleport / moveTo
@@ -5856,7 +6813,7 @@ _CAP_FIELD_TYPE_MAP = {
 def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
     for path, code in java_files.items():
         is_cap = bool(re.search(
-            r'implements\s+(?:[A-Za-z,\s]*\b(?:ICapabilityProvider|ICapabilitySerializable|INBTSerializable)\b)',
+            r'implements\s+(?:[A-Za-z,\s]*\b(?:ICapabilityProvider|ICapabilitySerializable|INBTSerializable|IEnergyStorage|IFluidHandler)\b)',
             code
         ))
         if not is_cap:
@@ -5864,11 +6821,14 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
         cls_name = extract_class_name(code) or os.path.splitext(os.path.basename(path))[0]
         safe_name = sanitize_identifier(cls_name)
 
+        is_energy = bool(re.search(r'IEnergyStorage', code))
+        is_fluid = bool(re.search(r'IFluidHandler', code))
+
         fields = re.findall(
             r'(?:private|protected|public)\s+(int|float|double|long|boolean|String|ItemStack|ResourceLocation)\s+(\w+)\s*(?:=|;)',
             code
         )
-        if not fields:
+        if not fields and not is_energy and not is_fluid:
             _PORTING_NOTES.append(
                 f"[capability] {cls_name}: implements ICapabilityProvider but no simple fields detected — "
                 f"convert to Bedrock dynamic properties manually"
@@ -5877,7 +6837,84 @@ def scan_capabilities(java_files: Dict[str, str], namespace: str) -> None:
 
         script_lines = [f'import {{ world }} from "@minecraft/server";', '']
 
-        for java_type, field_name in fields:
+        # Add energy if detected
+        if is_energy:
+            script_lines.append(
+                f'world.afterEvents.worldInitialize.subscribe((e) => {{'
+            )
+            script_lines.append(
+                f'    e.propertyRegistry.defineEntityNumberProperty("{namespace}:{safe_name}_energy", 0);'
+            )
+            script_lines.append('});')
+            script_lines.append('')
+
+        # Add fluid if detected
+        if is_fluid:
+            script_lines.append(
+                f'world.afterEvents.worldInitialize.subscribe((e) => {{'
+            )
+            script_lines.append(
+                f'    e.propertyRegistry.defineEntityNumberProperty("{namespace}:{safe_name}_fluid_amount", 0);'
+            )
+            script_lines.append(
+                f'    e.propertyRegistry.defineEntityStringProperty("{namespace}:{safe_name}_fluid_type", "minecraft:water");'
+            )
+            script_lines.append('});')
+            script_lines.append('')
+
+        # Add energy functions if detected
+        if is_energy:
+            script_lines += [
+                f'function receiveEnergy(entity, amount, simulate = false) {{',
+                f'    let current = entity.getDynamicProperty("{namespace}:{safe_name}_energy") || 0;',
+                f'    let newAmount = Math.min(current + amount, 1000000); // Assuming max capacity',
+                f'    if (!simulate) entity.setDynamicProperty("{namespace}:{safe_name}_energy", newAmount);',
+                f'    return newAmount - current;',
+                f'}}',
+                '',
+                f'function extractEnergy(entity, amount, simulate = false) {{',
+                f'    let current = entity.getDynamicProperty("{namespace}:{safe_name}_energy") || 0;',
+                f'    let extracted = Math.min(current, amount);',
+                f'    if (!simulate) entity.setDynamicProperty("{namespace}:{safe_name}_energy", current - extracted);',
+                f'    return extracted;',
+                f'}}',
+                '',
+                f'function getEnergyStored(entity) {{',
+                f'    return entity.getDynamicProperty("{namespace}:{safe_name}_energy") || 0;',
+                f'}}',
+                '',
+            ]
+
+        # Add fluid functions if detected
+        if is_fluid:
+            script_lines += [
+                f'function fill(entity, fluidStack, simulate = false) {{',
+                f'    let currentAmount = entity.getDynamicProperty("{namespace}:{safe_name}_fluid_amount") || 0;',
+                f'    let currentType = entity.getDynamicProperty("{namespace}:{safe_name}_fluid_type") || "minecraft:water";',
+                f'    if (currentAmount > 0 && fluidStack.type !== currentType) return 0;',
+                f'    let space = 1000 - currentAmount; // Assuming capacity 1000',
+                f'    let filled = Math.min(space, fluidStack.amount);',
+                f'    if (!simulate) {{',
+                f'        entity.setDynamicProperty("{namespace}:{safe_name}_fluid_amount", currentAmount + filled);',
+                f'        entity.setDynamicProperty("{namespace}:{safe_name}_fluid_type", fluidStack.type);',
+                f'    }}',
+                f'    return filled;',
+                f'}}',
+                '',
+                f'function drain(entity, amount, simulate = false) {{',
+                f'    let currentAmount = entity.getDynamicProperty("{namespace}:{safe_name}_fluid_amount") || 0;',
+                f'    let drained = Math.min(currentAmount, amount);',
+                f'    if (!simulate) {{',
+                f'        entity.setDynamicProperty("{namespace}:{safe_name}_fluid_amount", currentAmount - drained);',
+                f'    }}',
+                f'    return {{ amount: drained, type: entity.getDynamicProperty("{namespace}:{safe_name}_fluid_type") || "minecraft:water" }};',
+                f'}}',
+                '',
+                f'function getFluidAmount(entity) {{',
+                f'    return entity.getDynamicProperty("{namespace}:{safe_name}_fluid_amount") || 0;',
+                f'}}',
+                '',
+            ]
             bedrock_type = _CAP_FIELD_TYPE_MAP.get(java_type, "string")
             script_lines.append(
                 f'world.afterEvents.worldInitialize.subscribe((e) => {{'
@@ -6162,111 +7199,137 @@ def _get_player_var(event_type: str, param: str) -> str:
     return f"{param}.player"
 
 def _translate_handler_body(java_body: str, event_type: str, param: str, java_code_full: str, namespace: str, safe_name: str) -> list:
+    # Enhanced translation using AST parsing when available, falling back to regex patterns
+    # This provides more accurate Java-to-JS conversion for event handlers
     lines = []
     player = _get_player_var(event_type, param)
 
-    needs_inv = bool(re.search(r'\.shrink\s*\(|\.addItem\s*\(|getItemStack\s*\(', java_body))
-    needs_block = bool(re.search(r'setBlock\s*\(|getBlockState\s*\(|getBlockPos\s*\(|getHitVec\s*\(', java_body))
+    # Try AST-based translation first
+    ast_lines = JavaAST.translate_java_body_to_js(java_body, event_type, param, namespace, safe_name)
+    if ast_lines:
+        lines.extend(ast_lines)
+    else:
+        # Fallback to regex-based translation
+        needs_inv = bool(re.search(r'\.shrink\s*\(|\.addItem\s*\(|getItemStack\s*\(', java_body))
+        needs_block = bool(re.search(r'setBlock\s*\(|getBlockState\s*\(|getBlockPos\s*\(|getHitVec\s*\(', java_body))
 
-    if needs_inv:
-        lines.append(f'    const inv = {player}.getComponent("minecraft:inventory").container;')
-        lines.append(f'    const heldSlot = {player}.selectedSlotIndex;')
-        lines.append(f'    let heldItem = inv.getItem(heldSlot);')
+        if needs_inv:
+            lines.append(f'    const inv = {player}.getComponent("minecraft:inventory").container;')
+            lines.append(f'    const heldSlot = {player}.selectedSlotIndex;')
+            lines.append(f'    let heldItem = inv.getItem(heldSlot);')
 
-    if event_type == "PlayerInteractEvent.RightClickBlock" and needs_block:
-        lines.append(f'    const block = {param}.block;')
+        if event_type == "PlayerInteractEvent.RightClickBlock" and needs_block:
+            lines.append(f'    const block = {param}.block;')
 
-    if event_type == "PlayerInteractEvent.EntityInteract":
-        lines.append(f'    const target = {param}.target;')
+        if event_type == "PlayerInteractEvent.EntityInteract":
+            lines.append(f'    const target = {param}.target;')
 
-    if re.search(r'isCrouching\s*\(\s*\)|isSneaking\s*\(\s*\)', java_body):
-        lines.append(f'    if (!{player}.isSneaking) return;')
+        if re.search(r'isCrouching\s*\(\s*\)|isSneaking\s*\(\s*\)', java_body):
+            lines.append(f'    if (!{player}.isSneaking) return;')
 
-    null_checks = re.findall(r'(\w+)\s*!=\s*null', java_body)
-    entity_null = any(c in ("entityInteractEvent", param, "entity", "player") for c in null_checks)
-    if not entity_null and re.search(r'getEntity\s*\(\s*\)\s*!=\s*null', java_body):
-        lines.append(f'    if (!{player}) return;')
+        null_checks = re.findall(r'(\w+)\s*!=\s*null', java_body)
+        entity_null = any(c in ("entityInteractEvent", param, "entity", "player") for c in null_checks)
+        if not entity_null and re.search(r'getEntity\s*\(\s*\)\s*!=\s*null', java_body):
+            lines.append(f'    if (!{player}) return;')
 
-    target_type_check = re.search(
-        r'getTarget\s*\(\s*\)\.getType\s*\(\s*\)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
-        java_body
-    )
-    if target_type_check:
-        ref = target_type_check.group(1).split(".")[-1]
-        tag_path = _extract_tag_path(java_code_full, ref)
-        entity_hint = sanitize_identifier(tag_path.split("_for_")[0] if tag_path and "_for_" in tag_path else (tag_path or ref))
-        lines.append(f'    if (!target || !target.typeId.includes("{entity_hint}")) return;')
+        target_type_check = re.search(
+            r'getTarget\s*\(\s*\)\.getType\s*\(\s*\)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
+            java_body
+        )
+        if target_type_check:
+            ref = target_type_check.group(1).split(".")[-1]
+            tag_path = _extract_tag_path(java_code_full, ref)
+            entity_hint = sanitize_identifier(tag_path.split("_for_")[0] if tag_path and "_for_" in tag_path else (tag_path or ref))
+            lines.append(f'    if (!target || !target.typeId.includes("{entity_hint}")) return;')
 
-    item_is_checks = re.findall(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.is\s*\(\s*(\w+)\s*\)', java_body)
-    for tag_ref in item_is_checks:
-        tag_path = _extract_tag_path(java_code_full, tag_ref)
-        if tag_path:
-            lines.append(f'    if (!heldItem || !heldItem.hasTag("{namespace}:{tag_path}")) return;')
-        else:
+        item_is_checks = re.findall(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.is\s*\(\s*(\w+)\s*\)', java_body)
+        for tag_ref in item_is_checks:
             lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(tag_ref)}") return;')
+        item_identity_check = re.search(
+            r'(?:stack|itemStack|heldStack)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
+            java_body
+        )
+        
+        if item_identity_check and not item_is_checks:
+            ref = item_identity_check.group(1).split(".")[-1]
+            lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(ref)}") return;')
 
-    item_identity_check = re.search(
-        r'(?:stack|itemStack|heldStack)\.is\s*\(\s*(\w+(?:\.\w+)*)\s*\)',
-        java_body
-    )
-    if item_identity_check and not item_is_checks:
-        ref = item_identity_check.group(1).split(".")[-1]
-        lines.append(f'    if (!heldItem || heldItem.typeId !== "{namespace}:{sanitize_identifier(ref)}") return;')
-
-    repair_call = bool(re.search(r'repairState\s*\(', java_body))
-    if repair_call:
-        lines.append(f'    const repairedId = repairBlockId(block.typeId);')
-        lines.append(f'    if (!repairedId) return;')
-
-    hurt_break = re.search(r'hurtAndBreak\s*\(\s*(\d+)', java_body)
-    if hurt_break:
-        dmg = int(hurt_break.group(1))
-        lines.append(f'    const dur = heldItem?.getComponent("minecraft:durability");')
-        lines.append(f'    if (dur) {{ dur.damage = Math.min(dur.damage + {dmg}, dur.maxDurability); inv.setItem(heldSlot, heldItem); }}')
-
-    if re.search(r'level\.setBlock\s*\(', java_body):
+        repair_call = bool(re.search(r'repairState\s*\(', java_body))
         if repair_call:
-            lines.append(f'    block.setPermutation(BlockPermutation.resolve(repairedId));')
-        else:
-            lines.append(f'    block.setPermutation(block.permutation);')
+            lines.append(f'    const repairedId = repairBlockId(block.typeId);')
+            lines.append(f'    if (!repairedId) return;')
 
-    play_sound = re.search(
-        r'playSound\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*SoundEvents\.(\w+)',
-        java_body
-    )
-    if play_sound:
-        bedrock_sound = _SOUND_NAME_MAP.get(play_sound.group(1), "random.pop")
-        lines.append(f'    {player}.dimension.playSound("{bedrock_sound}", {player}.location);')
+        hurt_break = re.search(r'hurtAndBreak\s*\(\s*(\d+)', java_body)
+        if hurt_break:
+            dmg = int(hurt_break.group(1))
+            lines.append(f'    const dur = heldItem?.getComponent("minecraft:durability");')
+            lines.append(f'    if (dur) {{ dur.damage = Math.min(dur.damage + {dmg}, dur.maxDurability); inv.setItem(heldSlot, heldItem); }}')
 
-    if re.search(r'\.swing\s*\(', java_body):
-        lines.append(f'    {player}.playAnimation("animation.player.attack.rotations");')
+        if re.search(r'level\.setBlock\s*\(', java_body):
+            if repair_call:
+                lines.append(f'    block.setPermutation(BlockPermutation.resolve(repairedId));')
+            else:
+                lines.append(f'    block.setPermutation(block.permutation);')
 
-    instabuild = bool(re.search(r'getAbilities\s*\(\s*\)\.instabuild|isCreative\s*\(\s*\)', java_body))
-    shrink = re.search(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.shrink\s*\(\s*(\d+)\s*\)', java_body)
-    if shrink:
-        amt = int(shrink.group(1))
-        if instabuild:
-            lines.append(f'    if ({player}.getGameMode() !== GameMode.creative) {{')
-            lines.append(f'        if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
-            lines.append(f'    }}')
-        else:
-            lines.append(f'    if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
+        play_sound = re.search(
+            r'playSound\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*SoundEvents\.(\w+)',
+            java_body
+        )
+        if play_sound:
+            bedrock_sound = _SOUND_NAME_MAP.get(play_sound.group(1), "random.pop")
+            lines.append(f'    {player}.dimension.playSound("{bedrock_sound}", {player}.location);')
 
-    add_item = re.search(r'addItem\s*\(([^;]+)\)', java_body)
-    if add_item:
-        arg = add_item.group(1).strip()
-        const_m = re.search(r'\.([A-Z][A-Z0-9_]+)\b', arg)
-        if const_m:
-            const_name = const_m.group(1)
-            reg_m = re.search(
-                r'\b' + re.escape(const_name) + r'\b[^\n]*register\s*\(\s*["\']([a-z0-9_]+)["\']',
-                java_code_full, re.I
-            )
-            item_name = reg_m.group(1) if reg_m else sanitize_identifier(const_name)
-        else:
-            plain = arg.split(".")[0].strip()
-            item_name = sanitize_identifier(plain)
-        lines.append(f'    inv.addItem(new ItemStack("{namespace}:{item_name}"));')
+        if re.search(r'\.swing\s*\(', java_body):
+            lines.append(f'    {player}.playAnimation("animation.player.attack.rotations");')
+
+        instabuild = bool(re.search(r'getAbilities\s*\(\s*\)\.instabuild|isCreative\s*\(\s*\)', java_body))
+        shrink = re.search(r'(?:getItemStack\s*\(\s*\)|stack|itemStack)\.shrink\s*\(\s*(\d+)\s*\)', java_body)
+        if shrink:
+            amt = int(shrink.group(1))
+            if instabuild:
+                lines.append(f'    if ({player}.getGameMode() !== GameMode.creative) {{')
+                lines.append(f'        if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
+                lines.append(f'    }}')
+            else:
+                lines.append(f'    if (heldItem) {{ heldItem.amount = Math.max(0, heldItem.amount - {amt}); inv.setItem(heldSlot, heldItem.amount <= 0 ? undefined : heldItem); }}')
+
+        add_item = re.search(r'addItem\s*\(([^;]+)\)', java_body)
+        if add_item:
+            arg = add_item.group(1).strip()
+            const_m = re.search(r'\.([A-Z][A-Z0-9_]+)\b', arg)
+            if const_m:
+                const_name = const_m.group(1)
+                reg_m = re.search(
+                    r'\b' + re.escape(const_name) + r'\b[^\n]*register\s*\(\s*["\']([a-z0-9_]+)["\']',
+                    java_code_full, re.I
+                )
+                item_name = reg_m.group(1) if reg_m else sanitize_identifier(const_name)
+            else:
+                plain = arg.split(".")[0].strip()
+                item_name = sanitize_identifier(plain)
+            lines.append(f'    inv.addItem(new ItemStack("{namespace}:{item_name}"));')
+
+        # Additional patterns for energy and fluid calls
+        energy_receive = re.search(r'energy\.receiveEnergy\s*\(\s*(\d+)\s*\)', java_body)
+        if energy_receive:
+            amt = energy_receive.group(1)
+            lines.append(f'    receiveEnergy({player}, {amt});')
+
+        energy_extract = re.search(r'energy\.extractEnergy\s*\(\s*(\d+)\s*\)', java_body)
+        if energy_extract:
+            amt = energy_extract.group(1)
+            lines.append(f'    extractEnergy({player}, {amt});')
+
+        fluid_fill = re.search(r'fluid\.fill\s*\(\s*(\w+),\s*(\d+)\s*\)', java_body)
+        if fluid_fill:
+            fluid_type = fluid_fill.group(1)
+            amt = fluid_fill.group(2)
+            lines.append(f'    fill({player}, {{ type: "{namespace}:{fluid_type}", amount: {amt} }});')
+
+        fluid_drain = re.search(r'fluid\.drain\s*\(\s*(\d+)\s*\)', java_body)
+        if fluid_drain:
+            amt = fluid_drain.group(1)
+            lines.append(f'    drain({player}, {amt});')
 
     return lines
 
@@ -6493,30 +7556,136 @@ def convert_java_item_full(java_code: str, java_path: str, namespace: str):
     print(f"[item] Wrote {out_path}")
 JAVA_PARTICLE_MAP = {
     "explosion": "minecraft:explosion_particle",
-    "flame": "minecraft:basic_flame_particle",
-    "smoke": "minecraft:basic_smoke_particle",
-    "portal": "minecraft:portal_particle",
-    "crit": "minecraft:critical_hit_emitter",
-    "enchant": "minecraft:enchanting_table_particle",
-    "heart": "minecraft:heart_particle",
-    "angry": "minecraft:villager_angry_particle",
-    "happy": "minecraft:villager_happy_particle",
-    "splash": "minecraft:water_splash_particle",
+    "large_explosion": "minecraft:explosion_particle",
+    "huge_explosion": "minecraft:explosion_particle",
+    "fireworks_spark": "minecraft:fireworks_spark_particle",
     "bubble": "minecraft:bubble_particle",
-    "redstone": "minecraft:redstone_wire_dust_particle",
-    "dust": "minecraft:redstone_wire_dust_particle",
-    "block_crack": "minecraft:falling_dust_sand_particle",
-    "item_crack": "minecraft:basic_crit_particle",
+    "splash": "minecraft:water_splash_particle",
+    "wake": "minecraft:water_wake_particle",
+    "suspended": "minecraft:water_splash_particle",
+    "depth_suspend": "minecraft:water_splash_particle",
+    "crit": "minecraft:critical_hit_emitter",
+    "magic_crit": "minecraft:critical_hit_emitter",
+    "smoke": "minecraft:basic_smoke_particle",
+    "large_smoke": "minecraft:basic_smoke_particle",
+    "mob_spell": "minecraft:spell_particle",
+    "mob_spell_ambient": "minecraft:spell_particle",
+    "spell": "minecraft:spell_particle",
+    "instant_spell": "minecraft:spell_particle",
+    "witch_magic": "minecraft:witch_spell_particle",
+    "note": "minecraft:note_particle",
+    "portal": "minecraft:portal_particle",
+    "enchantment_table": "minecraft:enchanting_table_particle",
+    "flame": "minecraft:basic_flame_particle",
+    "lava": "minecraft:lava_particle",
+    "footstep": "minecraft:falling_dust_sand_particle",
+    "cloud": "minecraft:evaporation_particle",
+    "reddust": "minecraft:redstone_wire_dust_particle",
     "snowball": "minecraft:snowball_particle",
+    "drip_water": "minecraft:water_drip_particle",
+    "drip_lava": "minecraft:lava_drip_particle",
+    "snow_shovel": "minecraft:snowball_particle",
+    "slime": "minecraft:slime_particle",
+    "heart": "minecraft:heart_particle",
+    "angry_villager": "minecraft:villager_angry_particle",
+    "happy_villager": "minecraft:villager_happy_particle",
+    "barrier": "minecraft:barrier_particle",
+    "item_crack": "minecraft:basic_crit_particle",
+    "block_crack": "minecraft:falling_dust_sand_particle",
+    "block_dust": "minecraft:falling_dust_sand_particle",
+    "droplet": "minecraft:water_drip_particle",
+    "take": "minecraft:basic_crit_particle",
+    "mob_appearance": "minecraft:elder_guardian_particle",
+    "dragon_breath": "minecraft:dragon_breath_particle",
+    "end_rod": "minecraft:end_rod_particle",
+    "damage_indicator": "minecraft:critical_hit_emitter",
+    "sweep_attack": "minecraft:critical_hit_emitter",
     "totem": "minecraft:totem_particle",
+    "spit": "minecraft:llama_spit_particle",
+    "squid_ink": "minecraft:squid_ink_particle",
+    "bubble_pop": "minecraft:bubble_pop_particle",
+    "current_down": "minecraft:bubble_particle",
+    "bubble_column_up": "minecraft:bubble_particle",
+    "nautilus": "minecraft:nautilus_particle",
+    "dolphin": "minecraft:dolphin_particle",
+    "campfire_cosy_smoke": "minecraft:campfire_smoke_particle",
+    "campfire_signal_smoke": "minecraft:campfire_smoke_particle",
+    "composter": "minecraft:composter_particle",
+    "flash": "minecraft:flash_particle",
+    "falling_lava": "minecraft:lava_drip_particle",
+    "landing_lava": "minecraft:lava_particle",
+    "falling_water": "minecraft:water_drip_particle",
+    "dust": "minecraft:redstone_wire_dust_particle",
+    "item_snowball": "minecraft:snowball_particle",
+    "item_slime": "minecraft:slime_particle",
+    "item_squid_ink": "minecraft:squid_ink_particle",
+    "item_bubble_pop": "minecraft:bubble_pop_particle",
+    "item_current_down": "minecraft:bubble_particle",
+    "item_bubble_column_up": "minecraft:bubble_particle",
+    "item_nautilus": "minecraft:nautilus_particle",
+    "item_dolphin": "minecraft:dolphin_particle",
+    "item_campfire_cosy_smoke": "minecraft:campfire_smoke_particle",
+    "item_campfire_signal_smoke": "minecraft:campfire_smoke_particle",
+    "item_composter": "minecraft:composter_particle",
+    "item_flash": "minecraft:flash_particle",
+    "item_falling_lava": "minecraft:lava_drip_particle",
+    "item_landing_lava": "minecraft:lava_particle",
+    "item_falling_water": "minecraft:water_drip_particle",
+    "soul_fire_flame": "minecraft:soul_particle",
     "soul": "minecraft:soul_particle",
+    "ash": "minecraft:basic_smoke_particle",
+    "crimson_spore": "minecraft:crimson_spore_particle",
+    "warped_spore": "minecraft:warped_spore_particle",
+    "soul_fire_flame": "minecraft:soul_particle",
+    "dripping_obsidian_tear": "minecraft:obsidian_tear_particle",
+    "falling_obsidian_tear": "minecraft:obsidian_tear_particle",
+    "landing_obsidian_tear": "minecraft:obsidian_tear_particle",
+    "reverse_portal": "minecraft:portal_particle",
+    "white_ash": "minecraft:basic_smoke_particle",
+    "light": "minecraft:light_particle",
+    "dust_color_transition": "minecraft:redstone_wire_dust_particle",
+    "vibration": "minecraft:vibration_particle",
+    "falling_spore_blossom": "minecraft:spore_blossom_particle",
+    "spore_blossom_air": "minecraft:spore_blossom_particle",
+    "small_flame": "minecraft:basic_flame_particle",
+    "snowflake": "minecraft:snowball_particle",
+    "dripping_dripstone_lava": "minecraft:lava_drip_particle",
+    "falling_dripstone_lava": "minecraft:lava_drip_particle",
+    "dripping_dripstone_water": "minecraft:water_drip_particle",
+    "falling_dripstone_water": "minecraft:water_drip_particle",
+    "glow_squid_ink": "minecraft:squid_ink_particle",
+    "glow": "minecraft:glow_particle",
+    "wax_on": "minecraft:wax_particle",
+    "wax_off": "minecraft:wax_particle",
+    "electric_spark": "minecraft:electric_spark_particle",
+    "scrape": "minecraft:scrape_particle",
+    "shriek": "minecraft:shriek_particle",
+    "sonic_boom": "minecraft:sonic_boom_particle",
+    "sculk_soul": "minecraft:soul_particle",
+    "sculk_charge": "minecraft:sculk_charge_particle",
+    "sculk_charge_pop": "minecraft:sculk_charge_pop_particle",
+    "sonic_explosion": "minecraft:sonic_boom_particle",
+    "dust_plume": "minecraft:dust_plume_particle",
+    "gust": "minecraft:gust_particle",
+    "trial_spawner_detection": "minecraft:trial_spawner_detection_particle",
+    "trial_spawner_detection_ominous": "minecraft:trial_spawner_detection_ominous_particle",
+    "vault_connection": "minecraft:vault_connection_particle",
+    "dust_pillar": "minecraft:dust_pillar_particle",
+    "ominous_spawning": "minecraft:ominous_spawning_particle",
+    "raid_omen": "minecraft:raid_omen_particle",
+    "trial_omen": "minecraft:trial_omen_particle",
 }
 def extract_and_generate_particles(java_code: str, entity_id: str, namespace: str):
     safe_name = sanitize_identifier(entity_id.split(":")[-1])
     found = set()
-    for pattern, bedrock_ref in JAVA_PARTICLE_MAP.items():
-        if re.search(pattern, java_code, re.I):
-            found.add((pattern, bedrock_ref))
+    # Find all particle references
+    particle_refs = re.findall(r'\b(\w+)\s*\.\s*spawn\s*\(', java_code)  # Assuming spawn method
+    for ref in particle_refs:
+        if ref in JAVA_PARTICLE_MAP:
+            found.add((ref, JAVA_PARTICLE_MAP[ref]))
+        else:
+            # Custom particle, generate basic
+            found.add((ref, "minecraft:enchantment_table_particle"))  # Improved fallback
     if not found:
         return
     out_dir = os.path.join(RP_FOLDER, "particles")

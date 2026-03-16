@@ -1,4 +1,4 @@
-Tool_Version = "1.3"
+Tool_Version = "1.3.1"
 
 import os
 import re
@@ -4207,6 +4207,8 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
     extract_and_generate_particles(java_code, clean_identifier, namespace)
     if "TradeWithPlayerGoal" in ai_goals:
         generate_trading_table(clean_identifier, java_code, namespace)
+    # Generate Scripting API JS for complex entity behaviors (tick, hurt, die, interact, etc.)
+    generate_entity_script(java_code, clean_identifier.split(":")[-1], clean_identifier, namespace)
 def choose_icon_size_for(width: int, height: int) -> int:
     m = min(width, height)
     valid_under = [s for s in VALID_ICON_SIZES if s <= m]
@@ -5165,9 +5167,9 @@ _BLOCK_EVENT_METHOD_MAP = {
     "onPlace":         ("afterEvents", "playerPlaceBlock",        "event.player"),
     "onRemove":        ("afterEvents", "playerBreakBlock",        "event.player"),
     "playerDestroy":   ("afterEvents", "playerBreakBlock",        "event.player"),
-    "randomTick":      ("afterEvents", "entitySpawn",             "event.entity"),
-    "tick":            ("afterEvents", "entitySpawn",             "event.entity"),
 }
+# randomTick and tick require special handling (system.runInterval) — kept separate
+_BLOCK_TICK_METHODS = ["randomTick", "tick", "animateTick"]
 
 def generate_block_script(java_code: str, safe_name: str, block_id: str, namespace: str) -> bool:
     found_methods = []
@@ -5176,26 +5178,91 @@ def generate_block_script(java_code: str, safe_name: str, block_id: str, namespa
         if body:
             found_methods.append((method_name, phase, bedrock_event, entity_ref, body))
 
+    # Collect tick/randomTick bodies for system.runInterval treatment
+    tick_bodies = []
+    for method_name in _BLOCK_TICK_METHODS:
+        body = _extract_method_body(java_code, method_name)
+        if body:
+            tick_bodies.append((method_name, body))
+
+    # Detect BlockEntityTicker / getTicker for block entity tick behavior
+    has_be_ticker = bool(re.search(
+        r'getTicker\s*\(|BlockEntityTicker\s*<|createTickerHelper\s*\(',
+        java_code
+    ))
+    if has_be_ticker and not tick_bodies:
+        # Create a placeholder tick body so we emit at least a stub
+        tick_bodies.append(("blockEntityTick", ""))
+
+    # ContainerMenu / GUI detection → porting note
+    if re.search(r'AbstractContainerMenu|MenuType|createMenu\s*\(|getMenuType\s*\(', java_code):
+        _PORTING_NOTES.append(
+            f"[block] {safe_name}: uses a ContainerMenu / custom GUI. "
+            f"Custom GUIs have no direct Bedrock equivalent — consider using block inventory "
+            f"components (minecraft:inventory) and reading them via Scripting API, or a FormUI addon."
+        )
+
     static_handlers = _find_static_event_handlers(java_code)
 
-    if not found_methods and not static_handlers:
+    if not found_methods and not tick_bodies and not static_handlers:
         return False
 
     needs_permutation = _needs_repair_helper(static_handlers)
-    base_imports = "world, system, GameMode, ItemStack"
+    needs_system = bool(tick_bodies)
+    imports_parts = ["world"]
+    if needs_system:
+        imports_parts.append("system")
+    imports_parts += ["GameMode", "ItemStack"]
     if needs_permutation:
-        base_imports += ", BlockPermutation"
+        imports_parts.append("BlockPermutation")
+    base_imports = ", ".join(imports_parts)
     script_lines = [f'import {{ {base_imports} }} from "@minecraft/server";', '']
 
+    # Event-based methods
     for method_name, phase, bedrock_event, entity_ref, body in found_methods:
         translated = _translate_use_body(body, namespace, safe_name)
         script_lines += [
+            f'// {method_name}() → {bedrock_event}',
             f'world.{phase}.{bedrock_event}.subscribe((event) => {{',
             f'    const block = event.block;',
             f'    if (!block || block.typeId !== "{block_id}") return;',
             f'    const actor = {entity_ref};',
             f'    if (!actor) return;',
         ] + translated + ['});', '']
+
+    # randomTick / tick / blockEntityTick → system.runInterval
+    if tick_bodies:
+        script_lines += [
+            f'// Periodic tick behavior ported from: {", ".join(m for m, _ in tick_bodies)}',
+            f'// Uses system.runInterval — adjust interval as needed (20 = once per second)',
+            f'system.runInterval(() => {{',
+            f'    for (const dimName of ["overworld", "nether", "the_end"]) {{',
+            f'        const dim = world.getDimension(dimName);',
+            f'        // world.afterEvents.blockRandomTick is available in @minecraft/server ≥1.9',
+            f'        // For older packs, iterate nearby blocks manually:',
+        ]
+        for method_name, body in tick_bodies:
+            if body:
+                translated = _translate_use_body(body, namespace, safe_name)
+                script_lines += [f'        // === {method_name} ==='] + [
+                    '    ' + l if l.strip() else l for l in translated
+                ]
+            else:
+                script_lines.append(f'        // TODO: {method_name} — fill in block-entity tick logic here')
+        script_lines += [
+            '    }',
+            '}, 20);',
+            '',
+        ]
+        # Also emit the modern blockRandomTick subscription as a comment block
+        script_lines += [
+            f'// Modern alternative: use world.afterEvents.blockRandomTick (requires @minecraft/server ≥1.9):',
+            f'// world.afterEvents.blockRandomTick.subscribe((event) => {{',
+            f'//     if (event.block.typeId !== "{block_id}") return;',
+            f'//     // tick logic here',
+            f'// }});',
+            '',
+        ]
 
     for _, event_type, phase, bedrock_event, param, body in static_handlers:
         if script_lines[-1] != '':
@@ -5303,7 +5370,11 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
         lines.append(f'        player.setOnFire({seconds});')
 
     if re.search(r'player\.teleportTo\s*\(|player\.teleport\s*\(', body):
-        lines.append(f'        // TODO: implement teleport target from original Java logic')
+        tp_m = re.search(r'(?:teleportTo|teleport)\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
+        if tp_m:
+            lines.append(f'        player.teleport({{ x: {tp_m.group(1)}, y: {tp_m.group(2)}, z: {tp_m.group(3)} }});')
+        else:
+            lines.append(f'        // TODO: player.teleport(targetLocation);')
 
     cooldown_m = re.search(r'addCooldown\s*\(\s*this\s*,\s*(\d+)', body)
     if cooldown_m:
@@ -5314,7 +5385,304 @@ def _translate_use_body(body: str, namespace: str, safe_name: str) -> list:
         lines.append(f'        const inv = player.getComponent("minecraft:inventory");')
         lines.append(f'        if (inv) {{ const slot = inv.container.getSlot(player.selectedSlotIndex); slot.amount = Math.max(0, slot.amount - 1); }}')
 
+    # Explosion
+    explode_m = re.search(r'(?:explode|createExplosion)\s*\([^,)]*,\s*([0-9.f]+)', body)
+    if explode_m:
+        power = float(explode_m.group(1).rstrip('f'))
+        lines.append(f'        player.dimension.createExplosion(player.location, {power}, {{ breaksBlocks: true }});')
+
+    # XP / experience
+    xp_m = re.search(r'(?:addXp|giveExperiencePoints|giveExperience|addExperience)\s*\(\s*([0-9]+)', body)
+    if xp_m:
+        lines.append(f'        player.addExperience({xp_m.group(1)});')
+
+    # sendMessage / displayClientMessage
+    msg_m = re.search(r'(?:sendSystemMessage|displayClientMessage|sendMessage)\s*\(\s*(?:Component\.(?:literal|translatable)\s*\(\s*)?["\']([^"\']+)["\']', body)
+    if msg_m:
+        lines.append(f'        player.sendMessage("{msg_m.group(1)}");')
+    elif re.search(r'(?:sendSystemMessage|displayClientMessage|sendMessage)\s*\(', body):
+        lines.append(f'        // TODO: player.sendMessage("...");')
+
+    # setBlockAndUpdate / setBlock — change block state in world
+    setblock_m = re.search(r'(?:setBlockAndUpdate|setBlock)\s*\([^,]+,\s*Blocks\.(\w+)', body)
+    if setblock_m:
+        bedrock_block = f"minecraft:{setblock_m.group(1).lower()}"
+        lines.append(f'        // TODO: block.setPermutation(BlockPermutation.resolve("{bedrock_block}"));')
+
+    # scheduledTick / scheduleTick → system.runTimeout
+    sched_m = re.search(r'(?:scheduleTick|scheduleBlockTick)\s*\([^,]+,\s*[^,]+,\s*(\d+)', body)
+    if sched_m:
+        delay = int(sched_m.group(1))
+        lines.append(f'        system.runTimeout(() => {{')
+        lines.append(f'            // TODO: scheduled tick logic (originally {delay} game ticks)')
+        lines.append(f'        }}, {delay});')
+
+    # Particle spawning
+    particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
+    if particle_m:
+        java_particle = particle_m.group(1).split(".")[-1].lower()
+        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:basic_smoke_particle")
+        lines.append(f'        player.dimension.spawnParticle("{bedrock_particle}", player.location);')
+
+    # setDeltaMovement / velocity impulse
+    vel_m = re.search(r'setDeltaMovement\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
+    if vel_m:
+        lines.append(f'        player.applyImpulse({{ x: {vel_m.group(1)}, y: {vel_m.group(2)}, z: {vel_m.group(3)} }});')
+
+    # Dynamic property get/set (SynchedEntityData or NBT)
+    nbt_set = re.search(r'getPersistentData\(\)\.put(?:Int|Float|Double|Boolean|String)\s*\(\s*["\'](\w+)["\']', body)
+    if nbt_set:
+        lines.append(f'        // TODO: entity.setDynamicProperty("{namespace}:{nbt_set.group(1)}", value);')
+
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Entity Scripting API generation
+# ---------------------------------------------------------------------------
+
+_ENTITY_SCRIPT_METHODS: Dict[str, Tuple[str, str, str]] = {
+    # method_name: (phase, bedrock_event, entity_ref_in_event)
+    "hurt":                  ("afterEvents", "entityHurt",               "event.hurtEntity"),
+    "die":                   ("afterEvents", "entityDie",                "event.deadEntity"),
+    "doHurtTarget":          ("afterEvents", "entityHitEntity",          "event.damagingEntity"),
+    "performAttack":         ("afterEvents", "entityHitEntity",          "event.damagingEntity"),
+    "interact":              ("afterEvents", "playerInteractWithEntity",  "event.target"),
+    "interactAt":            ("afterEvents", "playerInteractWithEntity",  "event.target"),
+    "onAddedToWorld":        ("afterEvents", "entitySpawn",              "event.entity"),
+    "mobInteract":           ("afterEvents", "playerInteractWithEntity",  "event.target"),
+    "shoot":                 ("afterEvents", "projectileHitEntity",      "event.projectile"),
+    "onProjectileHit":       ("afterEvents", "projectileHitEntity",      "event.projectile"),
+}
+# Methods that need system.runInterval (per-tick behavior)
+_ENTITY_TICK_METHODS: List[str] = [
+    "tick", "aiStep", "customServerAiStep", "serverAiStep", "baseTick", "rideTick"
+]
+
+
+def _translate_entity_body(body: str, namespace: str, safe_name: str) -> list:
+    """Translate a Java entity method body into Bedrock Scripting API JS lines."""
+    lines = []
+
+    # Mob effects
+    for hit in re.findall(
+        r'new\s+MobEffectInstance\s*\(\s*MobEffects\.(\w+)\s*,\s*(\d+)\s*(?:,\s*(\d+))?',
+        body
+    ):
+        effect_key, dur, amp = hit
+        bedrock_effect = _EFFECT_NAME_MAP.get(effect_key, effect_key.lower())
+        lines.append(
+            f'            entity.addEffect("minecraft:{bedrock_effect}", {int(dur)/20}, '
+            f'{{ amplifier: {int(amp) if amp else 0}, showParticles: true }});'
+        )
+
+    # Sound
+    for hit in re.findall(r'SoundEvents\.(\w+)', body):
+        bedrock_sound = _SOUND_NAME_MAP.get(hit, "random.pop")
+        lines.append(f'            entity.dimension.playSound("{bedrock_sound}", entity.location);')
+
+    # Healing
+    heal_m = re.search(r'(?:heal|setHealth)\s*\(\s*([0-9.f]+)', body)
+    if heal_m:
+        amount = float(heal_m.group(1).rstrip('f'))
+        lines.append(f'            const health = entity.getComponent("minecraft:health");')
+        lines.append(f'            if (health) health.setCurrentValue(Math.min(health.currentValue + {amount}, health.effectiveMax));')
+
+    # Damage
+    hurt_m = re.search(r'(?<!player\.)(?:hurt|damage)\s*\(\s*[^,)]+,\s*([0-9.f]+)', body)
+    if hurt_m:
+        lines.append(f'            entity.applyDamage({float(hurt_m.group(1).rstrip("f"))});')
+
+    # On fire
+    fire_m = re.search(r'(?:setOnFire|setSecondsOnFire)\s*\(\s*(\d+)', body)
+    if fire_m:
+        lines.append(f'            entity.setOnFire({int(fire_m.group(1))});')
+
+    # Spawn entity
+    for hit in re.findall(r'(?:addFreshEntity|summon|spawnEntity)\s*\(\s*new\s+(\w+)\s*\(', body):
+        eid = f"{namespace}:{sanitize_identifier(hit)}"
+        lines.append(f'            entity.dimension.spawnEntity("{eid}", entity.location);')
+
+    # Explosion
+    explode_m = re.search(r'(?:explode|createExplosion)\s*\([^,)]*,\s*([0-9.f]+)', body)
+    if explode_m:
+        power = float(explode_m.group(1).rstrip('f'))
+        lines.append(f'            entity.dimension.createExplosion(entity.location, {power}, {{ breaksBlocks: true }});')
+
+    # Particle
+    particle_m = re.search(r'addParticle\s*\(\s*(\w+(?:\.\w+)*)\s*,', body)
+    if particle_m:
+        java_particle = particle_m.group(1).split(".")[-1].lower()
+        bedrock_particle = JAVA_PARTICLE_MAP.get(java_particle, "minecraft:basic_smoke_particle")
+        lines.append(f'            entity.dimension.spawnParticle("{bedrock_particle}", entity.location);')
+
+    # Teleport / moveTo
+    tp_m = re.search(r'(?:teleportTo|moveTo)\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
+    if tp_m:
+        lines.append(f'            entity.teleport({{ x: {tp_m.group(1)}, y: {tp_m.group(2)}, z: {tp_m.group(3)} }});')
+    elif re.search(r'teleportTo\s*\(|teleport\s*\(', body):
+        lines.append(f'            // TODO: entity.teleport(targetLocation);')
+
+    # Velocity impulse
+    vel_m = re.search(r'setDeltaMovement\s*\(\s*([0-9.-]+)\s*,\s*([0-9.-]+)\s*,\s*([0-9.-]+)', body)
+    if vel_m:
+        lines.append(f'            entity.applyImpulse({{ x: {vel_m.group(1)}, y: {vel_m.group(2)}, z: {vel_m.group(3)} }});')
+
+    # Remove entity
+    if re.search(r'(?:remove|discard)\s*\(\s*\)', body):
+        lines.append(f'            entity.remove();')
+
+    # SynchedEntityData → dynamic properties
+    for m in re.findall(r'entityData\.set\s*\(\s*(\w+)\s*,\s*(.+?)\s*\)', body):
+        field_ref, value_expr = m
+        v = value_expr.strip()
+        if re.match(r'^[0-9.-]+$', v) or v in ("true", "false"):
+            lines.append(f'            entity.setDynamicProperty("{namespace}:{safe_name}_{field_ref.lower()}", {v});')
+        else:
+            lines.append(f'            // TODO: entity.setDynamicProperty("{namespace}:{safe_name}_{field_ref.lower()}", value);')
+
+    # NBT persistent data
+    nbt_m = re.search(r'getPersistentData\(\)\.put(?:Int|Float|Double|Boolean|String)\s*\(\s*["\'](\w+)["\']', body)
+    if nbt_m:
+        lines.append(f'            // TODO: entity.setDynamicProperty("{namespace}:{nbt_m.group(1)}", value);')
+
+    if not lines:
+        lines.append(f'            // TODO: translate {safe_name} entity behavior manually')
+
+    return lines
+
+
+def generate_entity_dynamic_properties(java_code: str, safe_name: str, namespace: str) -> list:
+    """Return worldInitialize lines for SynchedEntityData fields → Bedrock dynamic properties."""
+    lines = []
+    for m in re.finditer(
+        r'EntityDataAccessor\s*<\s*(\w+)\s*>\s+(\w+)\s*=\s*SynchedEntityData\.defineId\s*\([^)]*EntityDataSerializers\.(\w+)',
+        java_code
+    ):
+        field_name = m.group(2).lower()
+        serializer = m.group(3)
+        prop_key = f'"{namespace}:{safe_name}_{field_name}"'
+        if serializer in ("BOOLEAN",):
+            lines.append(f'    e.propertyRegistry.defineEntityBooleanProperty({prop_key}, false);')
+        elif serializer in ("INT", "BYTE", "SHORT", "FLOAT", "DOUBLE",):
+            lines.append(f'    e.propertyRegistry.defineEntityNumberProperty({prop_key}, 0);')
+        elif serializer in ("STRING", "COMPOUND_TAG",):
+            lines.append(f'    e.propertyRegistry.defineEntityStringProperty({prop_key}, "");')
+        else:
+            lines.append(f'    // TODO: dynamic property for {field_name} (serializer={serializer})')
+    return lines
+
+
+def generate_entity_script(java_code: str, safe_name: str, entity_id: str, namespace: str) -> bool:
+    """Generate a Bedrock Scripting API .js file for entity Java behavior that JSON cannot express."""
+    script_parts: List[List[str]] = []
+    needs_system = False
+
+    # --- Per-tick methods → system.runInterval ---
+    tick_bodies = []
+    for method_name in _ENTITY_TICK_METHODS:
+        body = _extract_method_body(java_code, method_name)
+        if body:
+            tick_bodies.append((method_name, body))
+
+    if tick_bodies:
+        needs_system = True
+        tick_lines: List[str] = [
+            f'// Tick behavior ported from: {", ".join(m for m, _ in tick_bodies)}',
+            f'system.runInterval(() => {{',
+            f'    for (const dimName of ["overworld", "nether", "the_end"]) {{',
+            f'        let entities;',
+            f'        try {{ entities = world.getDimension(dimName).getEntities({{ type: "{entity_id}" }}); }}',
+            f'        catch (_) {{ continue; }}',
+            f'        for (const entity of entities) {{',
+        ]
+        for method_name, body in tick_bodies:
+            tick_lines.append(f'            // === {method_name} ===')
+            tick_lines += _translate_entity_body(body, namespace, safe_name)
+        tick_lines += ['        }', '    }', '}, 1);']
+        script_parts.append(tick_lines)
+
+    # --- Event-based methods ---
+    for method_name, (phase, bedrock_event, entity_ref) in _ENTITY_SCRIPT_METHODS.items():
+        body = _extract_method_body(java_code, method_name)
+        if not body:
+            continue
+        translated = _translate_entity_body(body, namespace, safe_name)
+        ev_lines = [
+            f'// {method_name}() → {bedrock_event}',
+            f'world.{phase}.{bedrock_event}.subscribe((event) => {{',
+            f'    const entity = {entity_ref};',
+            f'    if (!entity || entity.typeId !== "{entity_id}") return;',
+        ] + translated + ['});']
+        script_parts.append(ev_lines)
+
+    # --- SynchedEntityData → dynamic property registration ---
+    dp_lines = generate_entity_dynamic_properties(java_code, safe_name, namespace)
+    if dp_lines:
+        script_parts.append(
+            ['// SynchedEntityData → Bedrock dynamic properties',
+             'world.afterEvents.worldInitialize.subscribe((e) => {']
+            + dp_lines
+            + ['});']
+        )
+
+    # --- AbstractContainerMenu / GUI → porting note ---
+    if re.search(r'AbstractContainerMenu|MenuType|createMenu\s*\(|getMenuType\s*\(', java_code):
+        _PORTING_NOTES.append(
+            f"[entity] {safe_name}: uses AbstractContainerMenu (custom GUI). "
+            f"Custom GUIs have no Bedrock equivalent — use block inventory components or a Form UI addon."
+        )
+
+    # --- @EventBusSubscriber instance-level events ---
+    for event_type, (phase, bedrock_event) in _FORGE_EVENT_MAP.items():
+        short = event_type.split(".")[-1]
+        pat = (
+            r'(?:public|private|protected)\s+(?!static)\w+\s+(\w+)\s*\('
+            r'[^)]*?' + re.escape(short) + r'\s+(\w+)[^)]*?\)'
+        )
+        for m in re.finditer(pat, java_code, re.DOTALL):
+            method_name = m.group(1)
+            param_name  = m.group(2)
+            start = java_code.find('{', m.end())
+            if start == -1:
+                continue
+            depth, i, body = 0, start, ""
+            while i < len(java_code):
+                if java_code[i] == '{':    depth += 1
+                elif java_code[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        body = java_code[start:i + 1]
+                        break
+                i += 1
+            if body:
+                translated = _translate_handler_body(body, event_type, param_name, java_code, namespace, safe_name)
+                ev_lines = [
+                    f'// {method_name}() instance @SubscribeEvent → {bedrock_event}',
+                    f'world.{phase}.{bedrock_event}.subscribe(({param_name}) => {{',
+                ] + translated + ['});']
+                script_parts.append(ev_lines)
+
+    if not script_parts:
+        return False
+
+    imports = ['world']
+    if needs_system:
+        imports.append('system')
+    all_lines = [f'import {{ {", ".join(imports)} }} from "@minecraft/server";', '']
+    for i, part in enumerate(script_parts):
+        all_lines += part
+        if i < len(script_parts) - 1:
+            all_lines.append('')
+
+    out_path = os.path.join(BP_FOLDER, "scripts", f"entity_{safe_name}.js")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(all_lines))
+    print(f"[entity-script] Wrote {out_path}")
+    return True
+
+# ---------------------------------------------------------------------------
 
 _INHERITANCE_GRAPH: Dict[str, str] = {}
 _PORTING_NOTES: list = []
@@ -5926,21 +6294,28 @@ def _emit_repair_helper() -> list:
     ]
 
 def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namespace: str) -> bool:
-    use_body = _extract_method_body(java_code, "use")
-    hurt_body = _extract_method_body(java_code, "hurtEnemy")
-    tick_body = _extract_method_body(java_code, "inventoryTick")
+    use_body        = _extract_method_body(java_code, "use")
+    hurt_body       = _extract_method_body(java_code, "hurtEnemy")
+    tick_body       = _extract_method_body(java_code, "inventoryTick")
+    finish_body     = _extract_method_body(java_code, "finishUsingItem")
+    crafted_body    = _extract_method_body(java_code, "onCraftedBy")
     static_handlers = _find_static_event_handlers(java_code)
 
-    if not any([use_body, hurt_body, tick_body]) and not static_handlers:
+    has_instance_methods = any([use_body, hurt_body, tick_body, finish_body, crafted_body])
+    if not has_instance_methods and not static_handlers:
         return False
 
     needs_permutation = _needs_repair_helper(static_handlers)
-    base_imports = "world, system, GameMode, ItemStack"
+    needs_system      = bool(tick_body)
+    imports_parts     = ["world"]
+    if needs_system:
+        imports_parts.append("system")
+    imports_parts += ["GameMode", "ItemStack"]
     if needs_permutation:
-        base_imports += ", BlockPermutation"
+        imports_parts.append("BlockPermutation")
+    base_imports = ", ".join(imports_parts)
     script_lines = [f'import {{ {base_imports} }} from "@minecraft/server";', '']
 
-    has_instance_methods = any([use_body, hurt_body, tick_body])
     if has_instance_methods:
         script_lines += [
             f'const COMPONENT_ID = "{namespace}:{safe_name}_use";',
@@ -5953,15 +6328,61 @@ def generate_scripting_stub(java_code: str, safe_name: str, item_id: str, namesp
         if hurt_body:
             translated = _translate_use_body(hurt_body, namespace, safe_name)
             script_lines += ['    onHitEntity(event) {', '        const player = event.attackingEntity;', '        if (!player) return;'] + translated + ['    }']
+        if finish_body:
+            # finishUsingItem fires when the player finishes using (e.g. eating, drinking)
+            translated = _translate_use_body(finish_body, namespace, safe_name)
+            script_lines += ['    onConsume(event) {', '        const player = event.source;', '        if (!player) return;'] + translated + ['    }']
+        if crafted_body:
+            script_lines += [
+                '    // onCraftedBy → subscribe via world.afterEvents.crafted instead of a component method',
+                '    // See the world.afterEvents.crafted.subscribe block below.',
+            ]
         if tick_body:
-            script_lines += ['    onMineBlock(event) {', '        const player = event.source;', '        if (!player) return;', '    }']
+            # inventoryTick → system.runInterval scanning inventory, not a component callback
+            script_lines += [
+                '    // inventoryTick has no direct item-component callback.',
+                '    // Handled by the system.runInterval block below.',
+            ]
         script_lines += [
             '}',
             '',
             'world.beforeEvents.worldInitialize.subscribe((e) => {',
             f'    e.itemComponentRegistry.registerCustomComponent(COMPONENT_ID, new UseHandler());',
             '});',
+            '',
         ]
+
+    # inventoryTick → system.runInterval scanning all players' inventories
+    if tick_body:
+        translated = _translate_use_body(tick_body, namespace, safe_name)
+        script_lines += [
+            f'// inventoryTick() → scan every player inventory each tick',
+            f'system.runInterval(() => {{',
+            f'    for (const player of world.getAllPlayers()) {{',
+            f'        const inv = player.getComponent("minecraft:inventory")?.container;',
+            f'        if (!inv) continue;',
+            f'        for (let i = 0; i < inv.size; i++) {{',
+            f'            const item = inv.getItem(i);',
+            f'            if (!item || item.typeId !== "{item_id}") continue;',
+        ] + ['            ' + l.strip() for l in translated] + [
+            '        }',
+            '    }',
+            '}, 1);',
+            '',
+        ]
+
+    # onCraftedBy → world.afterEvents.crafted
+    if crafted_body:
+        translated = _translate_use_body(crafted_body, namespace, safe_name)
+        script_lines += [
+            f'// onCraftedBy() → crafted event',
+            f'world.afterEvents.crafted.subscribe((event) => {{',
+            f'    if (!event.craftingSlots) return;',
+            f'    const result = event.craftingSlots[0]?.item;',
+            f'    if (!result || result.typeId !== "{item_id}") return;',
+            f'    const player = event.player;',
+            f'    if (!player) return;',
+        ] + translated + ['});', '']
 
     for _, event_type, phase, bedrock_event, param, body in static_handlers:
         if script_lines and script_lines[-1] != '':

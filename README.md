@@ -11,6 +11,7 @@ ModMorpher tries to take a Minecraft Java mod and spit out a Bedrock add-on (`.m
 - converts GeckoLib animation ids into Bedrock `.animation.json` + controller stubs
 - extracts textures/models/sounds from the jar into a Bedrock pack
 - tries to “translate” common NBT/logic patterns, but it’s not magic
+- custom logic thingys to the Bedrock Scripting API
 
 ---
 

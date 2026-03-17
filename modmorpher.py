@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-Tool_Version = "1.4.1"
+Tool_Version = "1.4.1.1"
 
 import os
 import json
@@ -678,12 +678,6 @@ class JavaSymbolTable:
     def register_field(self, class_name: str, field_name: str, field_type: str):
         if class_name in self.classes:
             self.classes[class_name]['fields'][field_name] = field_type
-
-    def set_variable_type(self, var_name: str, var_type: str):
-        self.variables[var_name] = var_type
-
-    def get_variable_type(self, var_name: str) -> Optional[str]:
-        return self.variables.get(var_name)
 
     def set_variable_type(self, var_name: str, var_type: str):
         self.variables[var_name] = var_type
@@ -5362,7 +5356,7 @@ def convert_java_to_bedrock(java_path: str, entity_identifier: str, gecko_maps: 
 
 
     symbol_table = JavaSymbolTable()
-    symbol_table.build_from_code(java_code)
+    symbol_table.scan_java_file(java_code)
 
     parts = entity_identifier.split(":")
     namespace = sanitize_identifier(parts[0]) if parts else "converted"
@@ -6548,7 +6542,7 @@ def process_loot_tables_from_jar(jar_path: str, namespace: str):
     print(f"[loot] Converted {count} loot tables -> {out_base}")
 def generate_entity_script(java_code: str, entity_name: str, entity_id: str, namespace: str):
     symbol_table = JavaSymbolTable()
-    symbol_table.build_from_code(java_code)
+    symbol_table.scan_java_file(java_code)
 
 
     tick_method = detect_tick_method(java_code)

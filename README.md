@@ -24,7 +24,7 @@ This is made for **MCreator mods built with Forge / NeoForge**.
 | 1.18+ | Forge | best chance |
 | 1.12+ | Forge | will probably need manual fixes |
 | 1.3+ | Forge | not really worth it |
-| any | Fabric / Quilt | nope (not supported)
+| 1.20.1+ | Fabric / Quilt | not worth it, kinda have support not, but still would NOT RECOMEND
 
 > Hand-made mods can sometimes work, but you’ll often end up having to fix things by hand.
 

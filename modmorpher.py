@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-Tool_Version = "1.5"
+Tool_Version = "1.5.1"
 
 import os
 import json
@@ -574,6 +574,10 @@ class JavaSymbolTable:
             'addEffect':          '{0}.addEffect("{1}", {2}, {{ duration: {3} }})',
             'removeEffect':       '{0}.removeEffect("{1}")',
             'getName':            '{0}.nameTag',
+            'setGameMode':        '{0}.setGameMode({1})',
+            'kick':               '{0}.kick()',
+            'getDimension':       '{0}.dimension',
+            'getScoreboard':      'world.scoreboard',
         },
         'Entity': {
             'getHealth':    '{0}.getComponent("minecraft:health").currentValue',
@@ -593,7 +597,11 @@ class JavaSymbolTable:
             'addTag':       '{0}.addTag({1})',
             'removeTag':    '{0}.removeTag({1})',
             'getLevel':     '{0}.dimension',
-            'getCustomName':'{ 0}.nameTag',
+            'getDimension': '{0}.dimension',
+            'setOnFire':    '{0}.setOnFire({1})',
+            'getDynamicProperty': '{0}.getDynamicProperty({1})',
+            'setDynamicProperty': '{0}.setDynamicProperty({1}, {2})',
+            'getCustomName':'{0}.nameTag',
             'setCustomName':'{0}.nameTag = {1}',
         },
         'ItemStack': {
@@ -609,6 +617,10 @@ class JavaSymbolTable:
             'setDamageValue': '{0}.getComponent("minecraft:durability").damage = {1}',
             'getDisplayName': '({0}.nameTag ?? {0}.typeId)',
             'setCustomName':  '{0}.nameTag = {1}',
+            'getNameTag':     '{0}.nameTag',
+            'setNameTag':     '{0}.nameTag = {1}',
+            'getLore':        '{0}.getLore()',
+            'setLore':        '{0}.setLore({1})',
         },
         'Dimension': {
             'setBlockState':       '{0}.getBlock({1}).setPermutation({2})',
@@ -618,6 +630,12 @@ class JavaSymbolTable:
             'playSound':           '{0}.playSound("{1}", {2})',
             'getEntitiesOfClass':  '[...{0}.getEntities({{ type: "{1}" }})]',
             'getClosestPlayer':    '{0}.getPlayers()[0]',
+            'getEntities':         '{0}.getEntities({1})',
+            'spawnEntity':         '{0}.spawnEntity({1}, {2})',
+            'spawnItem':           '{0}.spawnItem({1}, {2})',
+            'fillBlocks':          '{0}.fillBlocks({1}, {2}, {3})',
+            'createExplosion':     '{0}.createExplosion({1}, {2}, {3})',
+            'getBlock':            '{0}.getBlock({1})',
         },
         'DynamicProperties': {
             'getInt':     '({0}.getDynamicProperty({1}) ?? 0)',
@@ -1941,7 +1959,8 @@ def ensure_dirs():
         "lang",
         "assets",
         "misc",
-        "biome_modifiers"
+        "biome_modifiers",
+        "dimensions"
     ]
     bp_subs = [
         "entities",
@@ -1952,7 +1971,8 @@ def ensure_dirs():
         "animations",
         "data",
         "recipes",
-        "loot_tables"
+        "loot_tables",
+        "dimensions"
     ]
     for folder, subs in [(RP_FOLDER, rp_subs), (BP_FOLDER, bp_subs)]:
         os.makedirs(folder, exist_ok=True)
@@ -2002,14 +2022,178 @@ def write_manifest_for(folder: str, pack_name: str, pack_type: str):
             imports = "\n".join(f'import "./{f}";' for f in sorted(entry_scripts))
             with open(main_js, "w", encoding="utf-8") as mf:
                 mf.write(imports + "\n")
-        manifest["dependencies"] = [
-                {
-                    "module_name": "@minecraft/server",
-                    "version": "1.13.0"
-                }
-            ]
+        dependencies = [
+            {
+                "module_name": "@minecraft/server",
+                "version": "1.13.0"
+            }
+        ]
+        dependencies.extend(collect_script_module_dependencies(scripts_dir))
+        manifest["dependencies"] = dependencies
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=4)
+
+def generate_dimension_document(
+    dimension_id: str,
+    min_y: int = -64,
+    max_y: int = 320,
+    format_version: str = "1.20.0"
+) -> dict:
+    return {
+        "format_version": format_version,
+        "minecraft:dimension_type": {
+            "description": {
+                "identifier": dimension_id
+            },
+            "components": {
+                "minecraft:dimension_bounds": {
+                    "min": min_y,
+                    "max": max_y
+                }
+            }
+        }
+    }
+
+def write_dimension_document(doc: dict, safe_name: str) -> None:
+    out_path = os.path.join(BP_FOLDER, "dimensions", f"{safe_name}.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    safe_write_json(out_path, doc)
+    print(f"[dimension] Wrote {out_path}")
+
+def generate_dimension_support_js(namespace: str, dimension_docs: Dict[str, dict]) -> None:
+    imports = 'import { world, system } from "@minecraft/server";'
+    lines = [imports, '']
+    lines.append('const DIMENSION_DEFS = {')
+    for dim_id, doc in sorted(dimension_docs.items()):
+        json_doc = json.dumps(doc, indent=2)
+        json_doc = json_doc.replace('\n', '\n  ')
+        lines.append(f'  {json.dumps(dim_id)}: {json_doc},')
+    if dimension_docs:
+        lines[-1] = lines[-1].rstrip(',')
+    lines.append('};')
+    lines.append('')
+    lines.append('function _resolveDimensionRegistry() {')
+    lines.append('    if (typeof DimensionRegistry !== "undefined" && typeof DimensionRegistry.registerCustomDimension === "function") {')
+    lines.append('        return DimensionRegistry;')
+    lines.append('    }')
+    lines.append('    if (typeof world.registerCustomDimension === "function") {')
+    lines.append('        return { registerCustomDimension: world.registerCustomDimension.bind(world) };')
+    lines.append('    }')
+    lines.append('    return null;')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function registerCustomDimension(def) {')
+    lines.append('    const registry = _resolveDimensionRegistry();')
+    lines.append('    if (!registry) {')
+    lines.append('        console.warn("[dimension] Custom dimension API unavailable");')
+    lines.append('        return;')
+    lines.append('    }')
+    lines.append('    try {')
+    lines.append('        registry.registerCustomDimension(def);')
+    lines.append('    } catch (err) {')
+    lines.append('        console.warn("[dimension] Failed to register dimension", err);')
+    lines.append('    }')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function registerPackDimensions() {')
+    lines.append('    for (const def of Object.values(DIMENSION_DEFS)) {')
+    lines.append('        registerCustomDimension(def);')
+    lines.append('    }')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function buildDimensionLocation(dimensionId, position = { x: 0, y: 0, z: 0 }) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return null;')
+    lines.append('    return { ...position, dimension };')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function teleportToDimension(entity, dimensionId, position, options = {}) {')
+    lines.append('    const target = buildDimensionLocation(dimensionId, position);')
+    lines.append('    if (!target) return false;')
+    lines.append('    entity.teleport({ ...target, ...options });')
+    lines.append('    return true;')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function getTopmostBlock(dimensionId, x, z, minHeight = -64) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return null;')
+    lines.append('    return dimension.getTopmostBlock({ x, z }, minHeight);')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function getBlockFromRay(dimensionId, origin, direction, options = {}) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return null;')
+    lines.append('    return dimension.getBlockFromRay(origin, direction, options);')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function containsBiomes(dimensionId, volume, biomeFilter, isSuperset = false) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return false;')
+    lines.append('    return dimension.containsBiomes(volume, { biomeFilter, isSuperset });')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function fillBlocks(dimensionId, volume, permutation, options = {}) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return false;')
+    lines.append('    return dimension.fillBlocks(volume, permutation, options);')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function spawnEntityInDimension(dimensionId, typeId, location) {')
+    lines.append('    const dimension = world.getDimension(dimensionId);')
+    lines.append('    if (!dimension) return null;')
+    lines.append('    return dimension.spawnEntity(typeId, location);')
+    lines.append('}')
+    lines.append('')
+    lines.append('export function onPlayerDimensionChange(callback) {')
+    lines.append('    return world.afterEvents.playerDimensionChange.subscribe(callback);')
+    lines.append('}')
+    lines.append('')
+    lines.append('world.afterEvents.worldInitialize.subscribe(() => {')
+    lines.append('    registerPackDimensions();')
+    lines.append('});')
+    lines.append('')
+    lines.append('globalThis.DimensionSupport = {')
+    lines.append('    registerCustomDimension,')
+    lines.append('    registerPackDimensions,')
+    lines.append('    buildDimensionLocation,')
+    lines.append('    teleportToDimension,')
+    lines.append('    getTopmostBlock,')
+    lines.append('    getBlockFromRay,')
+    lines.append('    containsBiomes,')
+    lines.append('    fillBlocks,')
+    lines.append('    spawnEntityInDimension,')
+    lines.append('};')
+    out_path = os.path.join(BP_FOLDER, 'scripts', 'dimension_support.js')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+    main_path = os.path.join(BP_FOLDER, 'scripts', 'main.js')
+    _ensure_main_import(main_path, 'import "./dimension_support.js";\n')
+    print(f"[dimension] Wrote {out_path} ({len(dimension_docs)} dimension def(s))")
+
+def scan_dimensions(java_files: Dict[str, str], namespace: str) -> list[str]:
+    candidates: Dict[str, dict] = {}
+    for code in java_files.values():
+        for m in re.finditer(r'new\s+ResourceLocation\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)', code):
+            ns_part, name = m.group(1), m.group(2)
+            if any(keyword in name.lower() for keyword in ('dim', 'dimension', 'portal', 'world', 'custom')):
+                dim_id = f"{ns_part}:{name}" if ':' not in name else name
+                candidates[dim_id] = {}
+        if re.search(r'\bDimensionType\b|\bEntityDimensions\b|\bDimensionRegistry\b', code):
+            fallback = f"{namespace}:custom_dimension"
+            if fallback not in candidates:
+                candidates[fallback] = {}
+    if not candidates:
+        return []
+    generated = {}
+    for dim_id in sorted(candidates):
+        safe_name = sanitize_identifier(dim_id.replace(':', '_'))
+        doc = generate_dimension_document(dim_id)
+        write_dimension_document(doc, safe_name)
+        generated[dim_id] = doc
+    generate_dimension_support_js(namespace, generated)
+    return list(generated.keys())
+
 def sanitize_identifier(name: Optional[str]) -> str:
     if not name:
         return ""
@@ -2051,6 +2235,33 @@ def safe_write_json(path: str, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
+
+def collect_script_module_dependencies(scripts_dir: str) -> List[dict]:
+    module_versions = {
+        '@minecraft/common': '1.13.0',
+        '@minecraft/debug-utilities': '1.13.0',
+        '@minecraft/server-ui': '1.13.0',
+        '@minecraft/server-net': '1.13.0',
+        '@minecraft/server-admin': '1.13.0',
+        '@minecraft/server-gametest': '1.13.0',
+    }
+    deps: List[dict] = []
+    if not os.path.isdir(scripts_dir):
+        return deps
+    for filename in os.listdir(scripts_dir):
+        if not filename.endswith('.js'):
+            continue
+        path = os.path.join(scripts_dir, filename)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+        for module_name, version in module_versions.items():
+            if module_name in content and not any(d['module_name'] == module_name for d in deps):
+                deps.append({'module_name': module_name, 'version': version})
+    return deps
+
 def find_jar_file(search_dir=".") -> Optional[str]:
     SKIP_SUFFIXES = ("-sources.jar", "-javadoc.jar", "-api.jar", "-slim.jar", "-dev.jar")
     candidates = []
@@ -8057,6 +8268,8 @@ def _extract_tag_path(java_code: str, field_name: str) -> Optional[str]:
     return m2.group(1) if m2 else None
 
 def _get_player_var(event_type: str, param: str) -> str:
+    if not event_type:
+        return param
     player_events = {
         "PlayerInteractEvent.EntityInteract",
         "PlayerInteractEvent.RightClickBlock",
@@ -10481,6 +10694,7 @@ def run_pipeline():
         "converted_blocks":      [],
         "scripts_written":       [],
         "mixins_converted":      [],
+        "converted_dimensions":  [],
     }
     with _logger.phase("Reading Java source", total=0, unit="file", colour="blue"):
         java_files = read_all_java_files(".")
@@ -10584,6 +10798,8 @@ def run_pipeline():
         scan_capabilities(java_files, namespace)
     with _logger.phase("Scanning networking", total=0, unit="step", colour="magenta"):
         scan_networking(java_files, namespace)
+    with _logger.phase("Scanning custom dimensions", total=0, unit="step", colour="magenta"):
+        stats["converted_dimensions"] = scan_dimensions(java_files, namespace)
     with _logger.phase("Scanning client-only classes", total=0, unit="step", colour="magenta"):
         scan_client_classes(java_files)
     with _logger.phase("Writing Global Cap Registry", total=0, unit="step", colour="green"):
@@ -10643,6 +10859,8 @@ def run_pipeline():
     script_count = len([f for f in os.listdir(scripts_dir) if f.endswith(".js") and f != "main.js"]) if os.path.isdir(scripts_dir) else 0
     if script_count:
         _orig(f"    Scripts       {script_count:>4}                        ")
+    if stats.get("converted_dimensions"):
+        _orig(f"    Dimensions    {len(stats['converted_dimensions']):>4}                        ")
     if _PORTING_NOTES:
         _orig(f"    Manual items  {len(_PORTING_NOTES):>4}  (see PORTING_NOTES.txt) ")
     gui_dir = os.path.join(RP_FOLDER, "ui")
@@ -11604,12 +11822,22 @@ def translate_method_invocation(invocation: object, player: str, namespace: str,
 JavaToBedrockMethodMap.STRICT_MAPPING.update({
     'world.getDimension': 'world.getDimension({0})',
     'world.getPlayers': 'world.getAllPlayers()',
+    'world.getAllPlayers': 'world.getAllPlayers()',
     'world.sendMessage': 'world.sendMessage({0})',
     'world.playSound': 'world.playSound({0}, {1})',
     'world.spawnParticle': 'world.spawnParticle({0}, {1})',
+    'world.spawnEntity': 'world.getDimension("minecraft:overworld").spawnEntity({0}, {1})',
+    'world.spawnItem': 'world.getDimension("minecraft:overworld").spawnItem({0}, {1})',
+    'scoreboard.addObjective': 'world.scoreboard.addObjective({0}, {1})',
+    'scoreboard.removeObjective': 'world.scoreboard.removeObjective({0})',
+    'scoreboard.getObjective': 'world.scoreboard.getObjective({0})',
+    'scoreboard.setObjectiveAtDisplaySlot': 'world.scoreboard.setObjectiveAtDisplaySlot({0}, {1})',
+    'scoreboardObjective.setScore': '{0}.setScore({1}, {2})',
+    'scoreboardObjective.getScore': '{0}.getScore({1})',
     'dimension.getBlock': '{0}.getBlock({1})',
     'dimension.getEntities': '{0}.getEntities({1})',
     'dimension.spawnEntity': '{0}.spawnEntity({1}, {2})',
+    'dimension.spawnItem': '{0}.spawnItem({1}, {2})',
     'entity.getComponent': '{0}.getComponent({1})',
     'entity.getDynamicProperty': '{0}.getDynamicProperty({1})',
     'entity.setDynamicProperty': '{0}.setDynamicProperty({1}, {2})',
@@ -11656,6 +11884,10 @@ def _mixin_target_name(code: str) -> Optional[str]:
 def _translate_use_body(body: str, namespace: str, safe_name: str) -> list[str]:
     if not body:
         return [f'    // TODO: translate {safe_name} manually']
+    if JAVALANG_AVAILABLE:
+        translated = JavaAST.translate_java_body_to_js(body, '', 'player', namespace, safe_name)
+        if translated:
+            return translated
     lines = []
     for raw in body.splitlines():
         raw = raw.rstrip()
@@ -12550,6 +12782,51 @@ def generate_bedrock_runtime_bridge(namespace: str) -> list[str]:
         '  hasTag: (entity, tag) => !!entity?.hasTag?.(tag),',
         '  tag: (entity, tag) => entity?.addTag?.(tag),',
         '  untag: (entity, tag) => entity?.removeTag?.(tag),',
+        '  getDimension: (dimensionId) => world.getDimension(dimensionId),',
+        '  teleportToDimension: (entity, dimensionId, position, options = {}) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    if (!dimension) return false;',
+        '    entity.teleport({ ...position, dimension, ...options });',
+        '    return true;',
+        '  },',
+        '  getTopmostBlock: (dimensionId, x, z, minHeight = -64) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.getTopmostBlock({ x, z }, minHeight) : null;',
+        '  },',
+        '  getBlockFromRay: (dimensionId, origin, direction, options = {}) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.getBlockFromRay(origin, direction, options) : null;',
+        '  },',
+        '  containsBiomes: (dimensionId, volume, biomeFilter, isSuperset = false) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.containsBiomes(volume, { biomeFilter, isSuperset }) : false;',
+        '  },',
+        '  fillBlocks: (dimensionId, volume, permutation, options = {}) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.fillBlocks(volume, permutation, options) : false;',
+        '  },',
+        '  spawnEntityInDimension: (dimensionId, typeId, location) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.spawnEntity(typeId, location) : null;',
+        '  },',
+        '  onPlayerDimensionChange: (fn) => world.afterEvents.playerDimensionChange.subscribe(fn),',
+        '  safeCall: (fn, fallback = undefined) => { try { return fn(); } catch { return fallback; } },',
+        '  getBlockFromRay: (dimensionId, origin, direction, options = {}) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.getBlockFromRay(origin, direction, options) : null;',
+        '  },',
+        '  containsBiomes: (dimensionId, volume, biomeFilter, isSuperset = false) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.containsBiomes(volume, { biomeFilter, isSuperset }) : false;',
+        '  },',
+        '  fillBlocks: (dimensionId, volume, permutation, options = {}) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.fillBlocks(volume, permutation, options) : false;',
+        '  },',
+        '  spawnEntityInDimension: (dimensionId, typeId, location) => {',
+        '    const dimension = world.getDimension(dimensionId);',
+        '    return dimension ? dimension.spawnEntity(typeId, location) : null;',
+        '  },',
         '  safeCall: (fn, fallback = undefined) => { try { return fn(); } catch { return fallback; } },',
         '};',
         '',

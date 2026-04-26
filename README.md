@@ -57,9 +57,9 @@ There will also be a `Bedrock_Pack/` folder with the raw pack structure if you w
 ---
 
 ## please don’t
-- use this to rip/redistribute paid or Marketplace content
+- use this to rip/redistribute paid or Marketplace content(IDK HOW YOU WOULD EVEN)
 - convert mods you don’t own or don’t have permission to convert
-- expect it to bypass DRM (it doesn’t)
+- expect it to bypass DRM (it doesn’t, and can't)
 
 ---
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-Tool_Version = "1.5.1"
+Tool_Version = "1.5.1.1"
 
 import os
 import json
@@ -21,12 +21,12 @@ except ImportError:
     TQDM_AVAILABLE = False
     _tqdm = None
 class _ProgressLogger:
-    _scary = (
+    _WARN_PATTERNS = (
         "", "warn", "Warn", "WARN", "[WARN]",
         "missing", "Missing", "placeholder", "fallback",
         "skipped", "Skipped",
     )
-    _bad_words = (
+    _ERROR_PATTERNS = (
         "", "error", "Error", "ERROR",
         "failed", "Failed", "exception", "Exception",
         "crash", "Crash",

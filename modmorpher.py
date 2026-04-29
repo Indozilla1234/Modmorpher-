@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-Tool_Version = "1.5.1.1"
-
 import os
 import json
 import uuid
 import zipfile
 import shutil
 import builtins
-import time
 import sys
 import math
 import subprocess
 import re
 from typing import Optional, Tuple, Dict, Set, List, Union
+
+Tool_Version = "1.5.1.1"
 try:
     from tqdm import tqdm as _tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
     _tqdm = None
+
+
 class _ProgressLogger:
     _WARN_PATTERNS = (
         "", "warn", "Warn", "WARN", "[WARN]",
@@ -36,25 +37,30 @@ class _ProgressLogger:
         self._active_bar = None
         self._intercepting = False
         self._deferred_messages: list = []
+
     def write(self, *args, **kwargs):
         text = " ".join(str(a) for a in args)
         if self._intercepting and self._active_bar is not None:
             if self._is_visible(text):
                 _tqdm.write(self._format(text))
         else:
-            self._original_print(text, **{k: v for k, v in kwargs.items() if k != "end"})
+            kw = {k: v for k, v in kwargs.items() if k != "end"}
+            self._original_print(text, **kw)
+
     def warn(self, text: str):
         msg = f"    {text}"
         if self._intercepting and self._active_bar is not None:
             _tqdm.write(msg)
         else:
             self._original_print(msg)
+
     def error(self, text: str):
         msg = f"    {text}"
         if self._intercepting and self._active_bar is not None:
             _tqdm.write(msg)
         else:
             self._original_print(msg)
+
     class _Phase:
         def __init__(self, logger, desc, total, unit, colour):
             self._logger = logger
@@ -63,6 +69,7 @@ class _ProgressLogger:
             self._unit = unit
             self._colour = colour
             self._bar = None
+
         def __enter__(self):
             if TQDM_AVAILABLE:
                 bar_fmt = (
@@ -84,24 +91,30 @@ class _ProgressLogger:
             else:
                 builtins.print(f"\n── {self._desc} ──")
             return self
+
         def __exit__(self, *_):
             builtins.print = self._logger._original_print
             self._logger._intercepting = False
             self._logger._active_bar = None
             if self._bar is not None:
                 self._bar.close()
+
         def update(self, n: int = 1):
             if self._bar:
                 self._bar.update(n)
+
         def set_postfix_str(self, s: str):
             if self._bar:
                 self._bar.set_postfix_str(s, refresh=False)
+
         def set_description(self, s: str):
             if self._bar:
                 self._bar.set_description(s, refresh=True)
+
     def phase(self, desc: str, total: int = 0,
               unit: str = "file", colour: str = "cyan"):
         return self._Phase(self, desc, total, unit, colour)
+
     def _is_visible(self, text: str) -> bool:
         for p in self._ERROR_PATTERNS:
             if p in text:
@@ -113,14 +126,23 @@ class _ProgressLogger:
     @staticmethod
     def _format(text: str) -> str:
         return f"    {text}"
+
+
 _logger = _ProgressLogger()
 _ALL_JAVA_FILES: Dict[str, str] = {}
-_RP_ASSET_INDEX: Dict[str, Union[list, dict]] = {"textures": [], "geometry": [], "flipbook_textures": {}}
+_RP_ASSET_INDEX: Dict[str, Union[list, dict]] = {
+    "textures": [],
+    "geometry": [],
+    "flipbook_textures": {}
+}
 try:
     from PIL import Image
     PIL_AVAILABLE = True
 except Exception:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow"])
+    subprocess.check_call([
+        sys.executable,
+        "-m", "pip", "install", "pillow"
+    ])
     PIL_AVAILABLE = True
 JAVALANG_AVAILABLE = False
 try:
@@ -12426,7 +12448,7 @@ def scan_mixins(java_files: Dict[str, str], namespace: str) -> list[str]:
                 annotation_args = m.group(1)
                 method_name = m.group(2) if kind != 'overwrite' else m.group(1)
                 method_body = _extract_method_body(code, method_name) or ''
-                event = _mixin_event_guess(method_name, annotation_args, method_body)
+                event = _mixin_event_guess(target, method_name, annotation_args, method_body)
                 if event and event.startswith('system.runInterval'):
                     script_lines += [f'// {kind} {method_name} -> scheduled tick', 'system.runInterval(() => {']
                     script_lines += _translate_mixin_body_to_js(method_body, namespace, safe_name) or ['    // tick body could not be translated cleanly']
@@ -12859,102 +12881,6 @@ def _mixin_modifier_lines(
     lines.append('')
     return lines
 
-def scan_mixins(java_files: Dict[str, str], namespace: str) -> List[str]:
-    notes: List[str] = []
-    out_dir = os.path.join(BP_FOLDER, 'scripts')
-    os.makedirs(out_dir, exist_ok=True)
-
-    for path, code in java_files.items():
-        if '@Mixin' not in code and 'mixin' not in os.path.basename(path).lower():
-            continue
-
-        cls_name = JavaAST(code).primary_class_name() or os.path.splitext(os.path.basename(path))[0]
-        safe_name = sanitize_identifier(cls_name)
-        target_cls = _mixin_target_name(code) or extract_class_name(code) or cls_name
-
-        script_lines: List[str] = [f'import {{ world, system }} from "@minecraft/server";', '']
-        wrote_anything = False
-
-        for sm in re.finditer(r'@Shadow\b[^\n]*\s+(?:public|protected|private|static|final|\s)+[\w<>,\[\].?$]+\s+(\w+)\s*(?:=|;)', code):
-            script_lines.extend(_mixin_shadow_lines(cls_name, sm.group(1), target_cls))
-            wrote_anything = True
-
-        for m in _MIXIN_METHOD_RE.finditer(code):
-            ann_block = m.group('ann') or ''
-            method_name = m.group('name')
-            return_type = m.group('rtype') or 'void'
-            params = _parse_java_params(m.group('params') or '')
-            body = _extract_block(code, m.start('head')) or ''
-            annotations = _annotation_text_map(ann_block)
-            ann_names = _mixin_annotation_names(ann_block)
-
-            if not ann_names:
-                continue
-
-            has_accessor = 'Accessor' in ann_names
-            has_invoker = 'Invoker' in ann_names
-            has_shadow = 'Shadow' in ann_names
-            has_inject = 'Inject' in ann_names
-            has_overwrite = 'Overwrite' in ann_names
-            has_redirect = 'Redirect' in ann_names
-            has_modify = any(k in ann_names for k in ('ModifyVariable', 'ModifyArg', 'ModifyArgs', 'ModifyConstant', 'WrapOperation', 'WrapWithCondition'))
-
-            if has_shadow and not (has_accessor or has_invoker):
-                script_lines.extend(_mixin_shadow_lines(cls_name, method_name, target_cls))
-                wrote_anything = True
-                continue
-
-            if has_accessor:
-                script_lines.extend(_mixin_accessor_invoker_lines('Accessor', cls_name, method_name, return_type, params, annotations, target_cls, safe_name))
-                notes.append(f'[mixin] {cls_name}: accessor {method_name} converted into helper wrapper')
-                wrote_anything = True
-                continue
-
-            if has_invoker:
-                script_lines.extend(_mixin_accessor_invoker_lines('Invoker', cls_name, method_name, return_type, params, annotations, target_cls, safe_name))
-                notes.append(f'[mixin] {cls_name}: invoker {method_name} converted into helper wrapper')
-                wrote_anything = True
-                continue
-
-            if has_modify:
-                kind = next(k for k in ('ModifyVariable', 'ModifyArg', 'ModifyArgs', 'ModifyConstant', 'WrapOperation', 'WrapWithCondition') if k in ann_names)
-                script_lines.extend(_mixin_modifier_lines(kind, cls_name, method_name, params, body, namespace, safe_name, annotations, target_cls))
-                wrote_anything = True
-
-                event = _mixin_event_guess(target_cls, method_name, ann_block, body, ann_names)
-                if event:
-                    script_lines.extend(_event_subscription_lines(target_cls, method_name, body, f'{safe_name}__{method_name}', params, annotations))
-                else:
-                    notes.append(f'[mixin] {cls_name}: {kind} {method_name} exported as helper wrapper')
-                continue
-
-            if has_inject or has_overwrite or has_redirect:
-                script_lines.extend(_mixin_wrapper_lines(cls_name, method_name, return_type, params, body, namespace, safe_name, annotations, target_cls))
-                wrote_anything = True
-                event = _mixin_event_guess(target_cls, method_name, ann_block, body, ann_names)
-                if event:
-                    script_lines.extend(_event_subscription_lines(target_cls, method_name, body, f'{safe_name}__{method_name}', params, annotations))
-                else:
-                    if has_redirect:
-                        notes.append(f'[mixin] {cls_name}: redirect {method_name} converted to wrapper helper; call-site redirection is not exact on Bedrock')
-                    else:
-                        notes.append(f'[mixin] {cls_name}: {method_name} translated as helper wrapper only (no Bedrock event mapping)')
-                continue
-
-            if re.search(r'\b(public|protected|private)\b', m.group('head') or ''):
-                script_lines.extend(_mixin_wrapper_lines(cls_name, method_name, return_type, params, body, namespace, safe_name, annotations, target_cls))
-                wrote_anything = True
-                notes.append(f'[mixin] {cls_name}: exported helper {method_name}')
-
-        if wrote_anything:
-
-            script_lines = generate_bedrock_script_boilerplate(namespace, target_cls) + [''] + script_lines
-            out_path = os.path.join(out_dir, f'mixin_{safe_name}.js')
-            with open(out_path, 'w', encoding='utf-8') as fh:
-                fh.write('\n'.join(script_lines))
-            print(f'[mixin] Wrote {out_path}')
-
-    return notes
 
 def scan_fabric_quilt_mixins(java_files: Dict[str, str], namespace: str) -> List[str]:
     return scan_mixins(java_files, namespace)

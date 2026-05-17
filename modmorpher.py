@@ -4760,6 +4760,9 @@ def write_rp_entity_json(entity_basename: str, namespace: str, texture_ref: str,
         "render_controllers": [controller_id],
         "materials": {"default": "entity_alphatest"}
     }
+    pending_sounds = _ENTITY_SOUND_EVENTS.get(f"{namespace_clean}:{entity_basename_clean}")
+    if pending_sounds:
+        description["sound_effects"] = dict(pending_sounds.get("events", {}))
     client_entity = {
         "format_version": BP_RP_FORMAT_VERSION,
         "minecraft:client_entity": {"description": description}
@@ -4868,7 +4871,10 @@ def convert_java_block_to_bedrock(java_path: str, namespace: str):
         comps["minecraft:loot"] = {"table": props["loot_table"]}
     else:
         comps["minecraft:loot"] = {"table": f"loot_tables/blocks/{sanitize_identifier(block_basename)}.json"}
-    comps["_converter_metadata"] = {"source_java_file": os.path.basename(java_path), "parsed_props": props}
+    sound_profile = _guess_block_sound_profile(java_code, namespace, block_id)
+    if sound_profile:
+        BLOCK_SOUND_PROFILES[block_id] = sound_profile
+    comps["_converter_metadata"] = {"source_java_file": os.path.basename(java_path), "parsed_props": props, "sound_profile": sound_profile}
     out_path = os.path.join(BP_FOLDER, "blocks", f"{sanitize_identifier(block_basename)}.json")
     safe_write_json(out_path, block_json)
     print(f"Converted block {java_path} -> {out_path}")
@@ -4977,7 +4983,10 @@ def convert_java_item_to_bedrock(java_path: str, namespace: str):
     comps["minecraft:max_stack_size"] = props.get("max_stack_size") if props.get("max_stack_size") is not None else 64
     if props.get("durability") is not None:
         comps["minecraft:durability"] = {"max_durability": props["durability"]}
-    comps["_converter_metadata"] = {"source_java_file": os.path.basename(java_path), "parsed_props": props}
+    sound_profile = _guess_item_sound_profile(java_code, namespace, item_id)
+    if sound_profile:
+        ITEM_SOUND_PROFILES[item_id] = sound_profile
+    comps["_converter_metadata"] = {"source_java_file": os.path.basename(java_path), "parsed_props": props, "sound_profile": sound_profile}
     out_bp = os.path.join(BP_FOLDER, "items", f"{sanitize_identifier(item_basename)}.json")
     safe_write_json(out_bp, bp_item)
     print(f"Converted item (BP) {java_path} -> {out_bp}")
@@ -6276,6 +6285,7 @@ def apply_entity_sounds(bedrock_entity: dict, sounds: dict, namespace: str,
             "pitch": [0.8, 1.2],
             "volume": 1.0
         }
+        _update_rp_entity_sound_effects(entity_id, events_block)
     for slot, sound_key in sounds.items():
         if sound_key not in COLLECTED_SOUND_DEFS:
             file_stem = sound_key.replace(".", "_")
@@ -6285,6 +6295,159 @@ def apply_entity_sounds(bedrock_entity: dict, sounds: dict, namespace: str,
                 "__stub__": True
             }
             print(f"  [sounds] Stub entry created: {sound_key} -> {file_path}")
+def _update_rp_entity_sound_effects(entity_id: str, sounds: dict) -> None:
+    if not entity_id or not sounds:
+        return
+    entity_base = sanitize_identifier(entity_id.split(':')[-1])
+    rp_path = os.path.join(RP_FOLDER, 'entity', f'{entity_base}.entity.json')
+    if not os.path.exists(rp_path):
+        return
+    try:
+        with open(rp_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        desc = data.setdefault('minecraft:client_entity', {}).setdefault('description', {})
+        desc['sound_effects'] = dict(sounds)
+        with open(rp_path, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+def _guess_block_sound_profile(java_code: str, namespace: str, block_id: str) -> dict:
+    code = java_code or ''
+    sounds = {}
+    sound_type = None
+    m = re.search(r'SoundType\.([A-Z_]+)', code)
+    if m:
+        sound_type = m.group(1).lower()
+    else:
+        m = re.search(r'sound\s*\(\s*SoundType\.([A-Z_]+)', code, re.I)
+        if m:
+            sound_type = m.group(1).lower()
+    if sound_type:
+        base = sanitize_sound_key(sound_type)
+        sounds = {
+            'step': f'{namespace}.{base}.step',
+            'place': f'{namespace}.{base}.place',
+            'break': f'{namespace}.{base}.break',
+            'hit': f'{namespace}.{base}.hit',
+            'fall': f'{namespace}.{base}.fall',
+        }
+    for m in re.finditer(r'(?:playSound|sound)\s*\([^\)]*(?:SoundEvents\.|ModSounds\.|Sounds\.)([A-Z0-9_]+)', code, re.I | re.DOTALL):
+        token = m.group(1).lower()
+        key = sanitize_sound_key(f'{namespace}.{block_id.split(":")[-1]}.{token}')
+        slot = 'place' if any(k in token for k in ('place', 'step', 'hit')) else 'break'
+        sounds[slot] = key
+    return sounds
+
+
+def _guess_item_sound_profile(java_code: str, namespace: str, item_id: str) -> dict:
+    code = java_code or ''
+    sounds = {}
+    for m in re.finditer(r'(?:playSound|sound)\s*\([^\)]*(?:SoundEvents\.|ModSounds\.|Sounds\.)([A-Z0-9_]+)', code, re.I | re.DOTALL):
+        token = m.group(1).lower()
+        key = sanitize_sound_key(f'{namespace}.{item_id.split(":")[-1]}.{token}')
+        slot = 'use'
+        if any(k in token for k in ('eat', 'drink', 'consume')):
+            slot = 'consume'
+        elif any(k in token for k in ('equip', 'armor')):
+            slot = 'equip'
+        elif any(k in token for k in ('swing', 'attack', 'hit')):
+            slot = 'swing'
+        elif any(k in token for k in ('break', 'shatter')):
+            slot = 'break'
+        sounds[slot] = key
+    if not sounds and re.search(r'FoodProperties|\.food\s*\(|nutrition|saturationMod', code, re.I):
+        sounds['consume'] = sanitize_sound_key(f'{namespace}.{item_id.split(":")[-1]}.consume')
+    return sounds
+
+
+def generate_sound_playback_script(namespace: str) -> None:
+    entity_entries = []
+    for entity_id, entry in sorted(_ENTITY_SOUND_EVENTS.items()):
+        desc = entry.get('events') if isinstance(entry, dict) else {}
+        if not desc:
+            continue
+        entity_entries.append({
+            'id': entity_id,
+            'events': desc,
+            'pitch': entry.get('pitch', [1.0, 1.0]) if isinstance(entry, dict) else [1.0, 1.0],
+            'volume': entry.get('volume', 1.0) if isinstance(entry, dict) else 1.0,
+        })
+
+    if not entity_entries and not BLOCK_SOUND_PROFILES and not ITEM_SOUND_PROFILES:
+        return
+
+    lines = ['import { world } from "@minecraft/server";', '', f'// Auto-generated sound router for {namespace}']
+    lines.append('const ENTITY_SOUNDS = ' + json.dumps(entity_entries, indent=2) + ';')
+    lines.append('const BLOCK_SOUNDS = ' + json.dumps(BLOCK_SOUND_PROFILES, indent=2) + ';')
+    lines.append('const ITEM_SOUNDS = ' + json.dumps(ITEM_SOUND_PROFILES, indent=2) + ';')
+    lines.extend([
+        '',
+        'function playSoundAt(dim, soundId, location, volume = 1.0, pitch = 1.0) {',
+        '  if (!dim || !soundId || !location) return;',
+        '  try {',
+        '    dim.playSound(soundId, location, { volume, pitch });',
+        '  } catch {',
+        '    try { dim.playSound(soundId, location); } catch {}',
+        '  }',
+        '}',
+        '',
+        'for (const entry of ENTITY_SOUNDS) {',
+        '  const typeId = entry.id;',
+        '  const events = entry.events || {};',
+        '  if (events.ambient) {',
+        '    world.afterEvents.entitySpawn.subscribe(({ entity }) => {',
+        '      if (entity?.typeId !== typeId) return;',
+        '      playSoundAt(entity.dimension, events.ambient, entity.location, entry.volume, 1.0);',
+        '    });',
+        '  }',
+        '  if (events.hurt) {',
+        '    world.afterEvents.entityHurt.subscribe(({ hurtEntity }) => {',
+        '      if (hurtEntity?.typeId !== typeId) return;',
+        '      playSoundAt(hurtEntity.dimension, events.hurt, hurtEntity.location, entry.volume, 1.0);',
+        '    });',
+        '  }',
+        '  if (events.death) {',
+        '    world.afterEvents.entityDie.subscribe(({ deadEntity }) => {',
+        '      if (deadEntity?.typeId !== typeId) return;',
+        '      playSoundAt(deadEntity.dimension, events.death, deadEntity.location, entry.volume, 1.0);',
+        '    });',
+        '  }',
+        '}',
+        '',
+        'for (const [blockId, sounds] of Object.entries(BLOCK_SOUNDS)) {',
+        '  world.afterEvents.playerPlaceBlock.subscribe(({ block, player }) => {',
+        '    if (block?.typeId !== blockId) return;',
+        '    const sound = sounds.place || sounds.step || sounds.use;',
+        '    if (sound) playSoundAt(player.dimension, sound, block.location, 1.0, 1.0);',
+        '  });',
+        '  world.afterEvents.playerBreakBlock.subscribe(({ brokenBlockPermutation, player, block }) => {',
+        '    const typeId = block?.typeId || brokenBlockPermutation?.type?.id;',
+        '    if (typeId !== blockId) return;',
+        '    const sound = sounds.break || sounds.hit || sounds.step;',
+        '    if (sound) playSoundAt(player.dimension, sound, block?.location || player.location, 1.0, 1.0);',
+        '  });',
+        '}',
+        '',
+        'for (const [itemId, sounds] of Object.entries(ITEM_SOUNDS)) {',
+        '  world.afterEvents.itemUse.subscribe(({ itemStack, source }) => {',
+        '    if (itemStack?.typeId !== itemId) return;',
+        '    const sound = sounds.use || sounds.consume || sounds.swing;',
+        '    if (sound) playSoundAt(source.dimension, sound, source.location, 1.0, 1.0);',
+        '  });',
+        '  world.afterEvents.itemCompleteUse.subscribe(({ itemStack, source }) => {',
+        '    if (itemStack?.typeId !== itemId) return;',
+        '    const sound = sounds.consume || sounds.use;',
+        '    if (sound) playSoundAt(source.dimension, sound, source.location, 1.0, 1.0);',
+        '  });',
+        '}',
+    ])
+    out_path = os.path.join(BP_FOLDER, 'scripts', 'sound_router.js')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(lines))
+    print(f'[sounds] Wrote {out_path}')
 JAVA_SLOT_TO_BEDROCK = {
     "HEAD": "slot.armor.head",
     "CHEST": "slot.armor.chest",
@@ -8776,6 +8939,7 @@ def generate_animation_controller(entity_id: str, animations: set, namespace: st
     spawn_anim  = pick("spawn")
     if not idle_anim:
         idle_anim = sorted(animations)[0]
+    # Keep all discovered animations alive in the controller, even if they do not match a known motion bucket.
     states = {}
     if has_spawn:
         states["spawn"] = {
@@ -9019,6 +9183,9 @@ def run_validation_pass() -> list:
 ENTITY_REGISTRY: Dict[str, str] = {}
 ATTRS_REGISTRY:  Dict[str, dict] = {}
 SOUND_CONST_MAP: Dict[str, str] = {}
+ENTITY_SOUND_PROFILES: Dict[str, dict] = {}
+BLOCK_SOUND_PROFILES: Dict[str, dict] = {}
+ITEM_SOUND_PROFILES: Dict[str, dict] = {}
 def detect_mod_id(java_files: dict) -> str:
     for path, code in java_files.items():
         ast = JavaAST(code)
@@ -10553,6 +10720,7 @@ def run_pipeline():
     with _logger.phase("Writing registries & lang", total=0, unit="step", colour="blue"):
         generate_texture_registry(pack_display_name)
         generate_sounds_registry(namespace)
+        generate_sound_playback_script(namespace)
         convert_lang_files()
     with _logger.phase("Scanning mixins", total=0, unit="step", colour="magenta"):
         scan_mixins(java_files, namespace)

@@ -12,7 +12,7 @@ import subprocess
 import re
 from typing import Optional, Tuple, Dict, Set, List, Union
 
-Tool_Version = "1.5.1.1"
+Tool_Version = "1.5.2"
 try:
     from tqdm import tqdm as _tqdm
     TQDM_AVAILABLE = True

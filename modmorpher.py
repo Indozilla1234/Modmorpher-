@@ -12,7 +12,7 @@ import subprocess
 import re
 from typing import Optional, Tuple, Dict, Set, List, Union
 
-Tool_Version = "1.5.2"
+Tool_Version = "1.5.2.1"
 try:
     from tqdm import tqdm as _tqdm
     TQDM_AVAILABLE = True
@@ -4762,7 +4762,11 @@ def write_rp_entity_json(entity_basename: str, namespace: str, texture_ref: str,
     }
     pending_sounds = _ENTITY_SOUND_EVENTS.get(f"{namespace_clean}:{entity_basename_clean}")
     if pending_sounds:
-        description["sound_effects"] = dict(pending_sounds.get("events", {}))
+        # Only animation-driven slots go in sound_effects; lifecycle slots are in sounds.json.
+        _ANIM_SLOTS = {"attack"}
+        anim_fx = {k: v for k, v in pending_sounds.get("events", {}).items() if k in _ANIM_SLOTS}
+        if anim_fx:
+            description["sound_effects"] = anim_fx
     client_entity = {
         "format_version": BP_RP_FORMAT_VERSION,
         "minecraft:client_entity": {"description": description}
@@ -6087,13 +6091,23 @@ def generate_sounds_registry(mod_name: str):
     else:
         print("[sounds] No sound definitions collected; skipping sound_definitions.json")
     if _ENTITY_SOUND_EVENTS:
-        sounds_json: dict = {}
+        entities_block: dict = {}
         for entity_id, entry in _ENTITY_SOUND_EVENTS.items():
-            outer_key = entity_id if entity_id.startswith("entity.") else f"entity.{entity_id}"
-            sounds_json[outer_key] = entry
+            events = entry.get("events", {}) if isinstance(entry, dict) else {}
+            pitch  = entry.get("pitch",  [0.8, 1.2]) if isinstance(entry, dict) else [0.8, 1.2]
+            volume = entry.get("volume", 1.0) if isinstance(entry, dict) else 1.0
+            events_out = {}
+            for slot, sound_key in events.items():
+                events_out[slot] = {"sound": sound_key, "volume": volume, "pitch": pitch}
+            entities_block[entity_id] = {
+                "volume": volume,
+                "pitch": pitch,
+                "events": events_out,
+            }
+        sounds_json = {"entity_sounds": {"entities": entities_block}}
         out_path = os.path.join(RP_FOLDER, "sounds.json")
         safe_write_json(out_path, sounds_json)
-        print(f"[sounds] Wrote sounds.json: {len(sounds_json)} entity sound entr{'y' if len(sounds_json)==1 else 'ies'}")
+        print(f"[sounds] Wrote sounds.json: {len(entities_block)} entity sound entr{'y' if len(entities_block)==1 else 'ies'}")
     else:
         print("[sounds] No entity sound events detected; skipping sounds.json")
 JAVA_MOB_EFFECT_MAP = {
@@ -6181,6 +6195,8 @@ JAVA_SOUND_METHOD_MAP = {
     "swimSound":        "swim",
     "getSplashSound":   "splash",
     "splashSound":      "splash",
+    "getAttackSound":   "attack",
+    "attackSound":      "attack",
 }
 def _best_sound_key(raw_id: str, namespace: str) -> str:
     raw_id = raw_id.strip().strip('"').strip("'")
@@ -6285,16 +6301,31 @@ def apply_entity_sounds(bedrock_entity: dict, sounds: dict, namespace: str,
             "pitch": [0.8, 1.2],
             "volume": 1.0
         }
-        _update_rp_entity_sound_effects(entity_id, events_block)
+        # Only put non-lifecycle sounds in the RP sound_effects block (used by animations).
+        # Lifecycle slots (ambient/hurt/death/step/swim/splash) are driven by sounds.json.
+        _ANIM_ONLY_SLOTS = {"attack"}
+        anim_sounds = {k: v for k, v in events_block.items() if k in _ANIM_ONLY_SLOTS}
+        _update_rp_entity_sound_effects(entity_id, anim_sounds)
+    _SLOT_CATEGORY = {
+        "ambient": "ambient",
+        "step":    "ambient",
+        "swim":    "ambient",
+        "splash":  "ambient",
+        "hurt":    "hostile",
+        "death":   "hostile",
+        "attack":  "hostile",
+    }
     for slot, sound_key in sounds.items():
         if sound_key not in COLLECTED_SOUND_DEFS:
             file_stem = sound_key.replace(".", "_")
             file_path = f"sound/{file_stem}"
+            category = _SLOT_CATEGORY.get(slot, "neutral")
             COLLECTED_SOUND_DEFS[sound_key] = {
+                "category": category,
                 "sounds": [{"name": file_path}],
                 "__stub__": True
             }
-            print(f"  [sounds] Stub entry created: {sound_key} -> {file_path}")
+            print(f"  [sounds] Stub entry created: {sound_key} -> {file_path} (category: {category})")
 def _update_rp_entity_sound_effects(entity_id: str, sounds: dict) -> None:
     if not entity_id or not sounds:
         return
@@ -6302,11 +6333,15 @@ def _update_rp_entity_sound_effects(entity_id: str, sounds: dict) -> None:
     rp_path = os.path.join(RP_FOLDER, 'entity', f'{entity_base}.entity.json')
     if not os.path.exists(rp_path):
         return
+    if not sounds:
+        return
     try:
         with open(rp_path, 'r', encoding='utf-8') as fh:
             data = json.load(fh)
         desc = data.setdefault('minecraft:client_entity', {}).setdefault('description', {})
-        desc['sound_effects'] = dict(sounds)
+        existing = desc.get('sound_effects', {})
+        existing.update(sounds)
+        desc['sound_effects'] = existing
         with open(rp_path, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, indent=2)
     except Exception:

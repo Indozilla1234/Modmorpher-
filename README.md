@@ -1,5 +1,7 @@
 # ModMorpher - Java → Bedrock migration thing
 
+   #trying to convert mods since June 9th 2025
+
 ⚠️ Heads up: this script will auto-install Python packages (`javalang`, `Pillow`, etc) the first time you run it. It’s annoying, but it’s required.
 
 ModMorpher tries to take a Minecraft Java mod and spit out a Bedrock add-on (`.mcaddon`). It’s not perfect, sometimes it borks things, but it usually gets you close enough to tweak manually.

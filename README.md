@@ -66,7 +66,7 @@ There will also be a `Bedrock_Pack/` folder with the raw pack structure if you w
 ## why the license stuff is here
 This project is meant to help mod creators & players, not to wreck people’s work.
 If you’re converting someone else’s mod, make sure you have permission.
-If it’s Marketplace/paid content, don’t.
+If it’s paid content, don’t.
 
 ---
 
